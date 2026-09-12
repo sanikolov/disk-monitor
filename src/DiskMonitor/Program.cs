@@ -11,6 +11,7 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        var logger = new MonitorLogger();
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, args) => LogUnhandled("The UI thread raised an unhandled exception.", args.Exception);
         AppDomain.CurrentDomain.UnhandledException += (_, args) => LogUnhandled(
@@ -33,7 +34,9 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
+        logger.Info($"Disk Monitor process starting (process ID {Environment.ProcessId}).");
         Application.Run(new TrayApplicationContext(showStatusSignal));
+        logger.Info("Disk Monitor UI message loop ended normally.");
     }
 
     private static void LogUnhandled(string message, Exception? exception)

@@ -58,7 +58,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
 
     public event EventHandler<IncidentRaisedEventArgs>? AlertRaised;
     public event EventHandler? IncidentsChanged;
-    public event EventHandler? ShutdownRequested;
+    public event EventHandler<ShutdownRequestedEventArgs>? ShutdownRequested;
 
     public DateTimeOffset BootTimeUtc => _bootTimeUtc;
 
@@ -146,7 +146,8 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         }
     }
 
-    private void OnShutdownRequested(object? sender, EventArgs args) => ShutdownRequested?.Invoke(this, EventArgs.Empty);
+    private void OnShutdownRequested(object? sender, ShutdownRequestedEventArgs args) =>
+        ShutdownRequested?.Invoke(this, args);
 
     private void OnAlertRaised(object? sender, IncidentRaisedEventArgs args) => AlertRaised?.Invoke(this, args);
 

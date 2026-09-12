@@ -12,12 +12,28 @@ internal sealed class DeviceChangeEventArgs : EventArgs
     public bool IsRemoval { get; }
 }
 
+internal enum ShutdownRequestReason
+{
+    WindowClose,
+    SessionEnding
+}
+
+internal sealed class ShutdownRequestedEventArgs : EventArgs
+{
+    public ShutdownRequestedEventArgs(ShutdownRequestReason reason)
+    {
+        Reason = reason;
+    }
+
+    public ShutdownRequestReason Reason { get; }
+}
+
 internal sealed class DeviceChangeMonitor : IDisposable
 {
     private DeviceNotificationWindow? _window;
 
     public event EventHandler<DeviceChangeEventArgs>? DeviceChanged;
-    public event EventHandler? ShutdownRequested;
+    public event EventHandler<ShutdownRequestedEventArgs>? ShutdownRequested;
 
     public void Start()
     {
@@ -32,7 +48,8 @@ internal sealed class DeviceChangeMonitor : IDisposable
 
     private void Raise(bool isRemoval) => DeviceChanged?.Invoke(this, new DeviceChangeEventArgs(isRemoval));
 
-    private void RaiseShutdownRequested() => ShutdownRequested?.Invoke(this, EventArgs.Empty);
+    private void RaiseShutdownRequested(ShutdownRequestReason reason) =>
+        ShutdownRequested?.Invoke(this, new ShutdownRequestedEventArgs(reason));
 
     private sealed class DeviceNotificationWindow : NativeWindow
     {
@@ -67,7 +84,7 @@ internal sealed class DeviceChangeMonitor : IDisposable
             {
                 if (message.WParam != IntPtr.Zero)
                 {
-                    _owner.RaiseShutdownRequested();
+                    _owner.RaiseShutdownRequested(ShutdownRequestReason.SessionEnding);
                 }
 
                 return;
@@ -75,7 +92,7 @@ internal sealed class DeviceChangeMonitor : IDisposable
 
             if (message.Msg == WmClose)
             {
-                _owner.RaiseShutdownRequested();
+                _owner.RaiseShutdownRequested(ShutdownRequestReason.WindowClose);
                 return;
             }
 

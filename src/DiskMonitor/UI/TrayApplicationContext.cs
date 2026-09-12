@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using DiskMonitor.Events;
 using DiskMonitor.Infrastructure;
 using DiskMonitor.Monitoring;
 using DiskMonitor.Models;
@@ -28,6 +29,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             executeOnlyOnce: false);
 
         _logger = new MonitorLogger();
+        _logger.Info($"Tray application context started (process ID {Environment.ProcessId}).");
         var options = new MonitorOptions();
         var stateStore = new JsonStateStore(_logger);
         _coordinator = new DiskMonitorCoordinator(_logger, stateStore, options);
@@ -40,7 +42,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add("Check now", null, (_, _) => _coordinator.CheckNow());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Open data folder", null, (_, _) => OpenDataFolder());
-        menu.Items.Add("Exit", null, (_, _) => ExitApplication());
+        menu.Items.Add("Exit", null, (_, _) => ExitApplication("The user selected Exit from the tray menu."));
 
         _notifyIcon = new NotifyIcon
         {
@@ -65,9 +67,16 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _uiContext.Post(_ => UpdateTrayState(), null);
     }
 
-    private void OnShutdownRequested(object? sender, EventArgs args)
+    private void OnShutdownRequested(object? sender, ShutdownRequestedEventArgs args)
     {
-        _uiContext.Post(_ => ExitApplication(), null);
+        var reason = args.Reason switch
+        {
+            ShutdownRequestReason.WindowClose => "The hidden device-notification window received WM_CLOSE.",
+            ShutdownRequestReason.SessionEnding => "Windows is ending the user session.",
+            _ => "Windows requested application shutdown."
+        };
+        _logger.Info($"Shutdown requested: {reason}");
+        _uiContext.Post(_ => ExitApplication(reason), null);
     }
 
     private void ShowAlert(Incident incident)
@@ -200,7 +209,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         form.Activate();
     }
 
-    private void ExitApplication()
+    private void ExitApplication(string reason)
     {
         if (_exiting)
         {
@@ -208,6 +217,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
 
         _exiting = true;
+        _logger.Info($"Disk Monitor is exiting. Reason: {reason}");
         _showStatusRegistration.Unregister(null);
         foreach (var form in _alertForms.ToList())
         {
@@ -220,6 +230,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _notifyIcon.Dispose();
         _trayIcon?.Dispose();
         _trayIcon = null;
+        _logger.Info("Disk Monitor cleanup completed; ending the UI message loop.");
         ExitThread();
     }
 }
