@@ -11,7 +11,7 @@ The first release intentionally does not attempt to be a SMART suite, filesystem
 The application starts at interactive logon, creates one tray icon, and keeps the main window hidden. A background coordinator owns three activities:
 
 1. Event-log watchers read the System channel plus the NTFS and, when the current user can access it, Storport Operational channels for disk, storage-controller, NTFS, Plug and Play, and USB-storage providers. Broken subscriptions are retried after a short backoff; inaccessible or disabled channels are skipped without disabling the other watchers.
-2. A periodic inventory refresh queries `MSFT_Disk` and `Win32_DiskDrive`, merging Windows health, operational status, bus, volume, PNP, SCSI-port, and PDO metadata.
+2. A periodic inventory refresh first queries current `Win32_PnPEntity` problem codes, then `MSFT_Disk` and `Win32_DiskDrive`, merging Windows health, operational status, bus, volume, PNP, SCSI-port, and PDO metadata.
 3. A lightweight `IOCTL_STORAGE_PREDICT_FAILURE` request is attempted against each physical disk. Unsupported devices and USB bridges are reported as unavailable, not unhealthy.
 
 The event watchers start independently so a WMI failure cannot disable telemetry. Observation processing waits briefly for the first inventory when possible, preserving device attribution without making event monitoring depend on WMI. Plug-and-Play notifications request a debounced refresh with a minimum interval so a burst or flap does not cause repeated controller queries.
@@ -31,6 +31,10 @@ Storport reset events usually identify only `\\Device\\RaidPortN`. When Windows 
 USB inventory diffs track repeated disappearance/reappearance of the same stable device identity. Three flaps in ten minutes produce a dedicated USB flapping incident. The lightweight prediction IOCTL is skipped for USB devices because bridges vary and probing can wake sleeping external disks; its supported/unsupported/access-denied result is shown once per non-USB device in the status window and log.
 
 Kernel-PnP and UMDF rules require storage-shaped instance metadata (`USBSTOR\\`, `SCSI\\Disk`, or a USB VID with the Windows disk class GUID). NTFS event 98 is kept only when its text indicates an actionable offline/full-check/corruption condition.
+
+The separate PnP inventory catches present USB, disk, and storage-controller failures even when no disk was enumerated and no matching event was logged. This includes code 43 / device descriptor failures present before application startup. Disconnected remembered devices and unrelated non-USB device classes are excluded. Unknown USB endpoints are not assumed to be disks and are never probed through physical-drive IOCTLs. Each observation includes the name, instance ID, class, problem code, and timestamp. Multiple failed endpoints remain separate incidents even when sampled simultaneously.
+
+Current PnP failures are observed on every refresh, with existing incident cooldowns limiting popups. This prevents persistent faults from aging out and restores an alert at the next refresh if it was manually cleared while the fault remained. Absence alone does not prove recovery: alerts remain available for investigation until cleared or stale. A failed PnP query raises a monitoring-coverage warning. The status window's Refresh button requests a hardware refresh, and incident details are visible there as well as in alerts and diagnostic logs.
 
 ## Privileges and packaging
 

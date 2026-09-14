@@ -42,7 +42,7 @@ internal sealed class StorageObservation : EventArgs
 
     public string EvidenceKey =>
         EventRecordId is null
-            ? $"{RuleId}|{Timestamp.UtcDateTime.Ticks}|{DiskNumber}|{DriveLetter}"
+            ? $"{RuleId}|{Timestamp.UtcDateTime.Ticks}|{DiskNumber}|{DriveLetter}|{DeviceToken}"
             : string.IsNullOrWhiteSpace(Channel)
                 ? $"{Source}|{EventRecordId.Value}"
                 : $"{Channel.ToLowerInvariant()}|{EventRecordId.Value}";

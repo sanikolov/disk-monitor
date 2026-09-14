@@ -12,6 +12,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
     private readonly MonitorOptions _options;
     private readonly DateTimeOffset _bootTimeUtc;
     private readonly StorageInventory _inventoryReader;
+    private readonly PnpProblemInventory _pnpProblemReader;
     private readonly EventLogMonitor _eventLogMonitor;
     private readonly DeviceChangeMonitor _deviceChangeMonitor;
     private readonly IncidentEngine _incidentEngine;
@@ -45,6 +46,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         _options = options;
         _bootTimeUtc = bootTimeUtc ?? SystemBootTime.GetUtc();
         _inventoryReader = new StorageInventory(logger);
+        _pnpProblemReader = new PnpProblemInventory(logger);
         _eventLogMonitor = new EventLogMonitor(logger, _bootTimeUtc);
         _deviceChangeMonitor = new DeviceChangeMonitor();
         _incidentEngine = new IncidentEngine(stateStore, logger, options);
@@ -263,6 +265,14 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         StorageInventorySnapshot snapshot;
         try
         {
+            // Evaluate current PnP failures even at startup and even if disk
+            // enumeration later fails. Re-observe persistent faults so reboot,
+            // manual clearing, or stale-incident expiry cannot hide them.
+            var problems = await Task.Run(_pnpProblemReader.Read, _shutdown.Token).ConfigureAwait(false);
+            foreach (var problem in problems)
+            {
+                _incidentEngine.Process(problem, null);
+            }
             snapshot = await Task.Run(_inventoryReader.Read, _shutdown.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
@@ -300,6 +310,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
 
         await ProbeFailurePredictionAsync(snapshot).ConfigureAwait(false);
         _incidentEngine.AutoResolveStale(DateTimeOffset.UtcNow);
+        IncidentsChanged?.Invoke(this, EventArgs.Empty);
     }
 
     private void EnqueueHealthObservations(DeviceSnapshot device, DeviceSnapshot? previous)

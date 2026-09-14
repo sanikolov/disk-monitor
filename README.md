@@ -8,6 +8,7 @@ The first release deliberately stays user-mode and conservative:
 
 - It watches the Windows System event log for disk, storage-controller, NTFS, Plug and Play, and USB-storage events.
 - It refreshes the Windows storage inventory periodically and checks the health state exposed by Windows.
+- It checks present USB devices, disks, and storage controllers for Plug and Play problem codes, including descriptor failures that prevent a drive from appearing in the disk inventory. Unidentified USB devices are reported without assuming they are disks.
 - It observes the NTFS and Storport Operational channels in addition to the System channel, and detects repeated USB disappearance/reappearance through inventory diffs.
 - It opportunistically asks a physical disk whether it predicts failure. Unsupported USB bridges and drivers are treated as unavailable, not unhealthy.
 - It does not write to disks, run `chkdsk`, scan the surface, run SMART self-tests, or upload telemetry.

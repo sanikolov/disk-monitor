@@ -46,7 +46,7 @@ internal sealed class StatusForm : Form
         _report.ClientSizeChanged += (_, _) => ResizeReportLines();
 
         var refresh = new Button { Text = "Refresh", AutoSize = true };
-        refresh.Click += (_, _) => RefreshStatus();
+        refresh.Click += (_, _) => _coordinator.CheckNow();
         var close = new Button { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel };
         close.Click += (_, _) => Close();
         _clearIncidentButton = new Button
@@ -172,7 +172,7 @@ internal sealed class StatusForm : Form
         AddSpacer();
         AddHeading("RISK GUIDE");
         AddRiskLine(null, RiskLevel.Benign, "No active issue is currently recorded.");
-        AddRiskLine(null, RiskLevel.Survivable, "The device is still responding, but retries, disconnects, or timeouts require a backup and investigation.");
+        AddRiskLine(null, RiskLevel.Survivable, "USB, device detection, I/O, or monitoring trouble requires investigation; a device may be inaccessible.");
         AddRiskLine(null, RiskLevel.Critical, "Corruption or hardware failure means data loss may be imminent or may already have occurred.");
         AddSpacer();
         AddHeading("DEVICES");
@@ -214,6 +214,7 @@ internal sealed class StatusForm : Form
                     $"{incident.DeviceName} - {incident.Category}");
                 AddLine(string.Format(CultureInfo.CurrentCulture, "  {0:g} to {1:g}; evidence={2}", incident.FirstSeen.ToLocalTime(), incident.LastSeen.ToLocalTime(), incident.EvidenceCount));
                 AddLine($"  {incident.Evidence.LastOrDefault()?.Summary ?? string.Empty}");
+                AddLine($"  {incident.Evidence.LastOrDefault()?.Details ?? string.Empty}", _secondaryTextColor);
                 AddSpacer(4);
             }
         }

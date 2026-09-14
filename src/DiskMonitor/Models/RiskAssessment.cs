@@ -41,7 +41,7 @@ internal static class RiskAssessment
     public static string Guidance(RiskLevel risk) => risk switch
     {
         RiskLevel.Benign => "No active Windows-reported storage issue since this reboot. Keep normal backups.",
-        RiskLevel.Survivable => "Recoverable I/O, USB, or timeout trouble was detected. Back up now and investigate.",
+        RiskLevel.Survivable => "USB, device detection, I/O, or monitoring trouble was detected. Protect accessible data and investigate; recovery is not assured.",
         RiskLevel.Critical => "Corruption or hardware failure was reported. Data loss may be imminent or may already have occurred; stop writes and protect the data now.",
         _ => throw new ArgumentOutOfRangeException(nameof(risk), risk, null)
     };

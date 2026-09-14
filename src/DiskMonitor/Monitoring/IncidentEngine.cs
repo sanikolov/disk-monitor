@@ -149,7 +149,7 @@ internal sealed class IncidentEngine : IDisposable
 
         if (alert is not null)
         {
-            _logger.Warn($"Alert raised for {alert.DeviceName}: {alert.Category}.");
+            _logger.Warn($"Alert raised: incident={alert.Id}; device={alert.DeviceName}; key={alert.DeviceKey}; category={alert.Category}; rule={observation.RuleId}; observed={observation.Timestamp:O}; {observation.Details}");
             AlertRaised?.Invoke(this, new IncidentRaisedEventArgs(alert));
         }
 
