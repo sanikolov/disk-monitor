@@ -13,12 +13,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private readonly MonitorLogger _logger;
     private readonly SynchronizationContext _uiContext;
     private readonly RegisteredWaitHandle _showStatusRegistration;
+    private readonly System.Windows.Forms.Timer _statusTimer;
     private readonly List<AlertForm> _alertForms = new();
     private Icon? _trayIcon;
+    private TrayIconState? _currentTrayState;
     private StatusForm? _statusForm;
     private bool _exiting;
+    private bool _monitoringWarningShown;
 
-    public TrayApplicationContext(EventWaitHandle showStatusSignal)
+    public TrayApplicationContext(EventWaitHandle showStatusSignal, MonitorLogger logger)
     {
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         _showStatusRegistration = ThreadPool.RegisterWaitForSingleObject(
@@ -28,13 +31,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
             Timeout.Infinite,
             executeOnlyOnce: false);
 
-        _logger = new MonitorLogger();
+        // Share the startup logger so a failed startup write remains visible in status.
+        _logger = logger;
         _logger.Info($"Tray application context started (process ID {Environment.ProcessId}).");
         var options = new MonitorOptions();
         var stateStore = new JsonStateStore(_logger);
         _coordinator = new DiskMonitorCoordinator(_logger, stateStore, options);
         _coordinator.AlertRaised += OnAlertRaised;
         _coordinator.IncidentsChanged += OnIncidentsChanged;
+        _coordinator.MonitoringChanged += OnMonitoringChanged;
         _coordinator.ShutdownRequested += OnShutdownRequested;
 
         var menu = new ContextMenuStrip();
@@ -53,7 +58,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _notifyIcon.DoubleClick += (_, _) => ShowStatus();
         SetTrayIcon(TrayIconState.Healthy);
 
+        // Inventory reads may stall without returning. The UI timer keeps the tray
+        // and the open status window honest about the age of their source data.
+        _statusTimer = new System.Windows.Forms.Timer { Interval = 15000 };
+        _statusTimer.Tick += (_, _) => UpdateTrayState();
         _coordinator.Start();
+        _statusTimer.Start();
         UpdateTrayState();
     }
 
@@ -64,8 +74,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void OnIncidentsChanged(object? sender, EventArgs args)
     {
-        _uiContext.Post(_ => UpdateTrayState(), null);
+        _uiContext.Post(_ => UpdateTrayState(refreshReport: true), null);
     }
+
+    private void OnMonitoringChanged(object? sender, EventArgs args) =>
+        _uiContext.Post(_ => UpdateTrayState(), null);
 
     private void OnShutdownRequested(object? sender, ShutdownRequestedEventArgs args)
     {
@@ -102,8 +115,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             _notifyIcon.ShowBalloonTip(
                 10000,
-                $"{RiskAssessment.Label(RiskAssessment.ForIncident(incident))}: storage issue detected",
-                $"{incident.DeviceName}: {incident.Evidence.LastOrDefault()?.Summary ?? incident.Headline}",
+                $"{RiskAssessment.Label(RiskAssessment.ForIncident(incident))}: storage issue since reboot",
+                $"{incident.DeviceName}: {incident.Evidence.LastOrDefault()?.Summary ?? incident.Headline} Last reported {incident.LastSeen.ToLocalTime():g}.",
                 ToolTipIcon.Error);
         }
         catch (Exception ex)
@@ -130,7 +143,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _statusForm.RefreshStatus();
     }
 
-    private void UpdateTrayState()
+    private void UpdateTrayState(bool refreshReport = false)
     {
         if (_exiting)
         {
@@ -138,12 +151,32 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
 
         var active = _coordinator.GetCurrentBootIncidents(activeOnly: true);
+        var monitoring = _coordinator.GetMonitoringStatus();
+        var degraded = monitoring.IsDegraded(DateTimeOffset.UtcNow);
         SetTrayIcon(active.Any(incident => !incident.Acknowledged)
             ? TrayIconState.Error
-            : active.Count > 0
+            : active.Count > 0 || degraded
                 ? TrayIconState.Warning
                 : TrayIconState.Healthy);
-        _notifyIcon.Text = active.Count == 0 ? "Disk Monitor: no active issues" : $"Disk Monitor: {active.Count} active issue(s)";
+        _notifyIcon.Text = degraded
+            ? "Disk Monitor: monitoring degraded"
+            : active.Count == 0 ? "Disk Monitor: no active issues" : $"Disk Monitor: {active.Count} active issue(s)";
+        if (degraded && !_monitoringWarningShown)
+        {
+            _monitoringWarningShown = true;
+            try
+            {
+                _notifyIcon.ShowBalloonTip(10000, "Disk Monitor needs attention", "A monitoring source is stale or unavailable. Open status for details.", ToolTipIcon.Warning);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn("Windows could not display the monitoring warning notification.", ex);
+            }
+        }
+        else if (!degraded)
+        {
+            _monitoringWarningShown = false;
+        }
         foreach (var form in _alertForms.ToList())
         {
             var updated = active.FirstOrDefault(incident => incident.Id.Equals(form.IncidentId, StringComparison.OrdinalIgnoreCase));
@@ -157,14 +190,27 @@ internal sealed class TrayApplicationContext : ApplicationContext
             }
         }
 
-        _statusForm?.RefreshStatus();
+        if (refreshReport)
+        {
+            _statusForm?.RefreshStatus();
+        }
+        else
+        {
+            _statusForm?.RefreshMonitoringIfChanged();
+        }
     }
 
     private void SetTrayIcon(TrayIconState state)
     {
+        if (_currentTrayState == state)
+        {
+            return;
+        }
+
         var replacement = TrayIconFactory.Create(state);
         var previous = _trayIcon;
         _trayIcon = replacement;
+        _currentTrayState = state;
         _notifyIcon.Icon = replacement;
         previous?.Dispose();
     }
@@ -217,6 +263,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
 
         _exiting = true;
+        _statusTimer.Stop();
+        _statusTimer.Dispose();
         _logger.Info($"Disk Monitor is exiting. Reason: {reason}");
         _showStatusRegistration.Unregister(null);
         foreach (var form in _alertForms.ToList())

@@ -8,6 +8,9 @@ namespace DiskMonitor.Events;
 
 internal sealed class EventLogMonitor : IDisposable
 {
+    private const int ErrorEventQueryResultStale = 15011;
+    private const int ErrorEventQueryResultInvalidPosition = 15012;
+
     private static readonly string[] Providers =
     {
         "disk", "Disk", "Microsoft-Windows-Disk",
@@ -15,6 +18,7 @@ internal sealed class EventLogMonitor : IDisposable
         "stornvme", "Microsoft-Windows-StorNvme",
         "storahci", "Microsoft-Windows-StorAHCI",
         "UASPStor",
+        "Microsoft-Windows-StorDiag",
         "Ntfs", "NTFS", "Microsoft-Windows-Ntfs",
         "Kernel-PnP", "Microsoft-Windows-Kernel-PnP",
         "USBSTOR", "Microsoft-Windows-USBSTOR",
@@ -25,7 +29,15 @@ internal sealed class EventLogMonitor : IDisposable
     {
         "System",
         "Microsoft-Windows-Ntfs/Operational",
+        "Microsoft-Windows-Storage-ClassPnP/Operational",
         "Microsoft-Windows-Storage-Storport/Operational"
+    };
+
+    private static readonly string[] RequiredChannels =
+    {
+        "System",
+        "Microsoft-Windows-Ntfs/Operational",
+        "Microsoft-Windows-Storage-ClassPnP/Operational"
     };
 
     private static readonly string[] NtfsProviders = { "Ntfs", "NTFS", "Microsoft-Windows-Ntfs" };
@@ -34,8 +46,12 @@ internal sealed class EventLogMonitor : IDisposable
     private readonly DateTimeOffset _bootTimeUtc;
     private readonly object _watcherGate = new();
     private readonly Dictionary<string, EventLogWatcher> _watchers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (long RecordId, EventBookmark Bookmark)> _lastBookmarks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _startingChannels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _activeChannels = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _restartingChannels = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _shutdown = new();
+    private bool _started;
     private bool _disposed;
 
     public EventLogMonitor(MonitorLogger logger, DateTimeOffset bootTimeUtc)
@@ -46,32 +62,56 @@ internal sealed class EventLogMonitor : IDisposable
 
     public event EventHandler<StorageObservation>? ObservationReceived;
 
+    public IReadOnlyList<string> GetMissingRequiredChannels()
+    {
+        lock (_watcherGate)
+        {
+            return RequiredChannels.Where(channel => !_activeChannels.Contains(channel)).ToArray();
+        }
+    }
+
+    public void RetryMissingRequiredChannels()
+    {
+        foreach (var channel in GetMissingRequiredChannels())
+        {
+            // Resume from the last delivered bookmark, or replay this boot if none
+            // exists. One blocked channel must not delay the other sources.
+            _ = Task.Run(() => StartWatcher(channel, readExistingEvents: true));
+        }
+    }
+
     public void Start()
     {
         lock (_watcherGate)
         {
-            if (_disposed || _watchers.Count > 0)
+            if (_disposed || _started)
+            {
+                return;
+            }
+
+            _started = true;
+        }
+
+        foreach (var channel in Channels)
+        {
+            // An Event Log API call can block. Keep WinForms startup and the other
+            // channels responsive while each subscription is established.
+            _ = Task.Run(() => StartWatcher(channel, readExistingEvents: true));
+        }
+
+        _logger.Info("Windows storage event subscription attempts started.");
+    }
+
+    private void StartWatcher(string channel, bool readExistingEvents)
+    {
+        lock (_watcherGate)
+        {
+            if (_disposed || _watchers.ContainsKey(channel) || !_startingChannels.Add(channel))
             {
                 return;
             }
         }
 
-        foreach (var channel in Channels)
-        {
-            StartWatcher(channel, readExistingEvents: true);
-        }
-
-        lock (_watcherGate)
-        {
-            if (_watchers.Count > 0)
-            {
-                _logger.Info("Windows storage event monitoring started.");
-            }
-        }
-    }
-
-    private void StartWatcher(string channel, bool readExistingEvents)
-    {
         try
         {
             _ = EventLogSession.GlobalSession.GetLogInformation(channel, PathType.LogName);
@@ -88,34 +128,95 @@ internal sealed class EventLogMonitor : IDisposable
                 channel,
                 PathType.LogName,
                 BuildQuery(channel, _bootTimeUtc, DateTimeOffset.UtcNow));
-            var watcher = new EventLogWatcher(query, null, readExistingEvents);
-            watcher.EventRecordWritten += OnEventRecordWritten;
+            EventBookmark? bookmark;
             lock (_watcherGate)
             {
-                if (_disposed)
-                {
-                    DisposeWatcher(watcher);
-                    return;
-                }
-
-                _watchers[channel] = watcher;
+                bookmark = _lastBookmarks.TryGetValue(channel, out var last) ? last.Bookmark : null;
             }
 
             try
             {
-                watcher.Enabled = true;
+                EnableWatcher(channel, query, bookmark, readExistingEvents);
             }
-            catch
+            catch (Exception ex) when (bookmark is not null && IsStaleBookmarkError(ex))
             {
-                RemoveWatcher(channel, watcher);
-                throw;
+                // Windows invalidates bookmarks when a channel is cleared or rolls
+                // over. Resume from the retained part of this boot exactly once.
+                lock (_watcherGate)
+                {
+                    if (_lastBookmarks.TryGetValue(channel, out var last) &&
+                        ReferenceEquals(last.Bookmark, bookmark))
+                    {
+                        _lastBookmarks.Remove(channel);
+                    }
+                }
+
+                _logger.Warn($"The Windows '{channel}' event-log bookmark is stale; replaying retained records since boot.", ex);
+                EnableWatcher(channel, query, bookmark: null, readExistingEvents: true);
             }
         }
         catch (Exception ex)
         {
             _logger.Warn($"Unable to subscribe to the Windows '{channel}' event log.", ex);
         }
+        finally
+        {
+            lock (_watcherGate)
+            {
+                _startingChannels.Remove(channel);
+            }
+        }
     }
+
+    private void EnableWatcher(string channel, EventLogQuery query, EventBookmark? bookmark, bool readExistingEvents)
+    {
+        var watcher = new EventLogWatcher(query, bookmark, readExistingEvents);
+        watcher.EventRecordWritten += OnEventRecordWritten;
+        bool alreadyRegistered;
+        lock (_watcherGate)
+        {
+            alreadyRegistered = _disposed || _watchers.ContainsKey(channel);
+            if (!alreadyRegistered)
+            {
+                _watchers[channel] = watcher;
+            }
+        }
+
+        if (alreadyRegistered)
+        {
+            DisposeWatcher(watcher);
+            return;
+        }
+
+        try
+        {
+            watcher.Enabled = true;
+            bool isActive;
+            lock (_watcherGate)
+            {
+                isActive = !_disposed && !_restartingChannels.Contains(channel) &&
+                           _watchers.TryGetValue(channel, out var current) && ReferenceEquals(current, watcher);
+                if (isActive)
+                {
+                    _activeChannels.Add(channel);
+                }
+            }
+
+            if (isActive)
+            {
+                _logger.Info($"Windows '{channel}' event-log watcher is active.");
+            }
+        }
+        catch
+        {
+            RemoveWatcher(channel, watcher);
+            throw;
+        }
+    }
+
+    internal static bool IsStaleBookmarkError(Exception exception) =>
+        exception is EventLogException &&
+        (exception.HResult & 0xFFFF) is ErrorEventQueryResultStale or ErrorEventQueryResultInvalidPosition;
 
     private void OnEventRecordWritten(object? sender, EventRecordWrittenEventArgs args)
     {
@@ -124,6 +225,16 @@ internal sealed class EventLogMonitor : IDisposable
             var channel = sender is EventLogWatcher failedWatcher
                 ? GetWatcherChannel(failedWatcher)
                 : null;
+            if (channel is not null && IsStaleBookmarkError(args.EventException))
+            {
+                lock (_watcherGate)
+                {
+                    _lastBookmarks.Remove(channel);
+                }
+
+                _logger.Warn($"The Windows '{channel}' event-log bookmark became stale; recovery will replay retained records since boot.");
+            }
+
             _logger.Warn(
                 $"The Windows '{channel ?? "unknown"}' event-log watcher reported a subscription failure.",
                 args.EventException);
@@ -147,6 +258,22 @@ internal sealed class EventLogMonitor : IDisposable
             if (observation is not null)
             {
                 ObservationReceived?.Invoke(this, observation);
+            }
+
+            var channel = args.EventRecord.LogName ??
+                          (sender is EventLogWatcher watcher ? GetWatcherChannel(watcher) : null);
+            var recordId = args.EventRecord.RecordId;
+            if (channel is not null && recordId is not null)
+            {
+                lock (_watcherGate)
+                {
+                    // Watchers can overlap during recovery. Keep the furthest point
+                    // seen so replay starts after the newest processed record.
+                    if (!_lastBookmarks.TryGetValue(channel, out var last) || recordId.Value > last.RecordId)
+                    {
+                        _lastBookmarks[channel] = (recordId.Value, args.EventRecord.Bookmark);
+                    }
+                }
             }
         }
         catch (Exception ex)
@@ -181,6 +308,8 @@ internal sealed class EventLogMonitor : IDisposable
             _shutdown.Cancel();
             watchers = _watchers.Values.ToArray();
             _watchers.Clear();
+            _activeChannels.Clear();
+            _startingChannels.Clear();
             _restartingChannels.Clear();
         }
 
@@ -202,6 +331,8 @@ internal sealed class EventLogMonitor : IDisposable
             {
                 return;
             }
+
+            _activeChannels.Remove(channel);
         }
 
         _ = RestartWatcherAsync(channel, failedWatcher);
@@ -213,7 +344,16 @@ internal sealed class EventLogMonitor : IDisposable
         {
             await Task.Delay(TimeSpan.FromSeconds(5), _shutdown.Token).ConfigureAwait(false);
             RemoveWatcher(channel, failedWatcher);
-            StartWatcher(channel, readExistingEvents: false);
+            lock (_watcherGate)
+            {
+                // The failed watcher is detached. Permit the replacement to become
+                // active; StartWatcher still serializes concurrent recovery attempts.
+                _restartingChannels.Remove(channel);
+            }
+
+            // Resume after the last delivered record so an outage is caught up
+            // without replaying the entire boot on every recovery.
+            StartWatcher(channel, readExistingEvents: true);
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
@@ -245,6 +385,7 @@ internal sealed class EventLogMonitor : IDisposable
             }
 
             _watchers.Remove(channel);
+            _activeChannels.Remove(channel);
         }
 
         DisposeWatcher(watcher);
@@ -283,19 +424,22 @@ internal sealed class EventLogMonitor : IDisposable
         var milliseconds = Math.Max(
             1,
             (long)Math.Ceiling(Math.Max(0, uptime.TotalMilliseconds) + TimeSpan.FromMinutes(1).TotalMilliseconds));
-        var providerFilter = string.Join(" or ", Providers.Select(provider => $"Provider[@Name='{provider}']"));
         var informationalNtfsFilter = string.Join(" or ", NtfsProviders.Select(provider => $"Provider[@Name='{provider}']"));
         var escapedChannel = System.Security.SecurityElement.Escape(channel);
+        // Windows Event Log rejects the combined provider/level/time predicate once
+        // it has too many XPath terms. Separate Select elements form a union while
+        // keeping each predicate small enough for the event service to evaluate.
+        var warningAndErrorSelects = Providers.Chunk(6).Select(group =>
+        {
+            var providers = string.Join(" or ", group.Select(provider => $"Provider[@Name='{provider}']"));
+            return $"<Select Path=\"{escapedChannel}\">*[System[({providers}) and (Level=1 or Level=2 or Level=3) and TimeCreated[timediff(@SystemTime) &lt;= {milliseconds}]]]</Select>";
+        });
 
         return $"""
             <QueryList>
               <Query Id="0">
-                <Select Path="{escapedChannel}">*[System[
-                  ({providerFilter}) and
-                  ((Level=1 or Level=2 or Level=3) or
-                   (Level=4 and EventID=98 and ({informationalNtfsFilter}))) and
-                  TimeCreated[timediff(@SystemTime) &lt;= {milliseconds}]
-                ]]</Select>
+                {string.Join(Environment.NewLine, warningAndErrorSelects)}
+                <Select Path="{escapedChannel}">*[System[Level=4 and EventID=98 and ({informationalNtfsFilter}) and TimeCreated[timediff(@SystemTime) &lt;= {milliseconds}]]]</Select>
               </Query>
             </QueryList>
             """;
@@ -308,6 +452,11 @@ internal static class EventObservationParser
     private static readonly Regex DriveLetterRegex = new(@"(?<![A-Za-z])(?<drive>[A-Za-z]):", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex DeviceTokenRegex = new(@"(?<token>\\Device\\[^,\s)]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex RaidPortRegex = new(@"RaidPort(?<number>\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly string[] StorageCommandFields =
+    {
+        "DeviceNumber", "Vendor", "Model", "SerialNumber", "SrbStatus",
+        "ScsiStatus", "SenseKey", "AdditionalSenseCode", "CdbBytes", "NumberOfRetriesDone"
+    };
 
     public static StorageObservation? Parse(EventRecord record, DateTimeOffset bootTimeUtc)
     {
@@ -349,11 +498,23 @@ internal static class EventObservationParser
 
         var timestamp = timeCreated.HasValue ? ToUtc(timeCreated.Value) : DateTimeOffset.UtcNow;
         var identityText = $"{payloadText}\n{details}";
-        var diskNumber = ParseDiskNumber(values) ?? ParseDiskNumber(identityText);
+        // ClassPnP reports a physical DeviceNumber but no volume. It must be correlated
+        // with the inventory by serial as disk numbers can change after a restart.
+        var diskNumber = rule.Id == "storage.command-failed"
+            ? ParseClassPnpDeviceNumber(values)
+            : ParseDiskNumber(values) ?? ParseDiskNumber(identityText);
+        var deviceSerialNumber = values.TryGetValue("DeviceSerialNumber", out var ntfsSerial)
+            ? ntfsSerial.Trim()
+            : values.TryGetValue("SerialNumber", out var storageSerial)
+                ? storageSerial.Trim()
+                : null;
         var driveLetter = ParseDriveLetter(values) ??
                           (rule.Category == ObservationCategory.Ntfs ? ParseDriveLetter(details) : null);
         var deviceToken = ParseDeviceToken(values, identityText);
         var raidPort = ParseRaidPort(identityText);
+        var observationDetails = rule.Id == "storage.command-failed"
+            ? AddStorageCommandFields(details, values)
+            : details;
 
         return new StorageObservation
         {
@@ -367,8 +528,9 @@ internal static class EventObservationParser
             Severity = rule.Severity,
             AlertMode = rule.AlertMode,
             Summary = rule.Summary,
-            Details = details,
+            Details = observationDetails,
             DiskNumber = diskNumber,
+            DeviceSerialNumber = deviceSerialNumber,
             RaidPortNumber = raidPort,
             DriveLetter = driveLetter,
             DeviceToken = deviceToken,
@@ -424,8 +586,16 @@ internal static class EventObservationParser
                 55 => new EventRule("ntfs.corruption", ObservationCategory.Ntfs, ObservationSeverity.Critical, AlertMode.Immediate, "NTFS reported that the filesystem structure is corrupt."),
                 98 => new EventRule("ntfs.chkdsk-required", ObservationCategory.Ntfs, ObservationSeverity.Critical, AlertMode.Immediate, "NTFS reported that the volume requires a full filesystem check."),
                 140 => new EventRule("ntfs.device-missing", ObservationCategory.Ntfs, ObservationSeverity.Error, AlertMode.Immediate, "NTFS reported that a device does not exist or is unavailable."),
+                147 => new EventRule("ntfs.slow-io", ObservationCategory.Ntfs, ObservationSeverity.Warning, AlertMode.Repeated, "NTFS reported a slow I/O operation."),
                 _ => null
             };
+        }
+
+        if (provider == "microsoft-windows-stordiag" && id == 507)
+        {
+            // A failed non-data SCSI command may be a rejected capability probe.
+            // Repetition warrants investigation without implying lost user data.
+            return new EventRule("storage.command-failed", ObservationCategory.Storage, ObservationSeverity.Warning, AlertMode.Repeated, "Windows reported a failed non-read/write storage command.");
         }
 
         if (provider.Contains("kernel-pnp", StringComparison.Ordinal))
@@ -618,6 +788,21 @@ internal static class EventObservationParser
         }
 
         return null;
+    }
+
+    private static int? ParseClassPnpDeviceNumber(Dictionary<string, string> values) =>
+        values.TryGetValue("DeviceNumber", out var text) && int.TryParse(text, out var number)
+            ? number
+            : null;
+
+    private static string AddStorageCommandFields(string description, Dictionary<string, string> values)
+    {
+        // StorDiag 507's formatted message omits the fields needed to distinguish
+        // a rejected capability probe from retries or failed user-data writes.
+        var fields = StorageCommandFields
+            .Where(values.ContainsKey)
+            .Select(name => $"{name}={values[name].Trim()}");
+        return $"{description} {string.Join("; ", fields)}".Trim();
     }
 
     private static int? ParseDiskNumber(string text)

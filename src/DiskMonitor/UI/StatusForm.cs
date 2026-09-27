@@ -21,6 +21,12 @@ internal sealed class StatusForm : Form
     private Color _textColor;
     private Color _secondaryTextColor;
     private Color _headingColor;
+    private MonitorStatusSnapshot? _lastRenderedMonitoring;
+    private bool _lastRenderedMonitoringDegraded;
+    private bool _lastRenderedInventoryStale;
+    private bool _lastRenderedDiagnosticLogStale;
+    private bool _lastRenderedEventChannelsStarting;
+    private Label? _displayTimeLabel;
 
     public StatusForm(DiskMonitorCoordinator coordinator, Action openDataFolderAction)
     {
@@ -147,12 +153,25 @@ internal sealed class StatusForm : Form
             .ThenByDescending(incident => incident.Severity)
             .ThenByDescending(incident => incident.LastSeen)
             .ToList();
-        var overallRisk = RiskAssessment.Overall(allIncidents, _coordinator.BootTimeUtc);
+        var nowUtc = DateTimeOffset.UtcNow;
+        var monitoring = _coordinator.GetMonitoringStatus();
+        var monitoringDegraded = monitoring.IsDegraded(nowUtc);
+        _lastRenderedMonitoring = monitoring;
+        _lastRenderedMonitoringDegraded = monitoringDegraded;
+        _lastRenderedInventoryStale = monitoring.InventoryIsStale(nowUtc);
+        _lastRenderedDiagnosticLogStale = monitoring.DiagnosticLogIsStale(nowUtc);
+        _lastRenderedEventChannelsStarting = monitoring.EventChannelsAreStarting(nowUtc);
+        var incidentRisk = RiskAssessment.Overall(allIncidents, _coordinator.BootTimeUtc);
+        var overallRisk = monitoringDegraded && incidentRisk == RiskLevel.Benign
+            ? RiskLevel.Survivable
+            : incidentRisk;
 
+        var previousScroll = _report.AutoScrollPosition;
         _report.SuspendLayout();
         ClearReport();
         AddHeading("DISK MONITOR");
-        AddLine(string.Format(CultureInfo.CurrentCulture, "Updated: {0:g}", DateTimeOffset.Now));
+        AddLine(DisplayTime(nowUtc));
+        _displayTimeLabel = (Label)_report.Controls[_report.Controls.Count - 1];
         AddLine(string.Format(
             CultureInfo.CurrentCulture,
             "Assessment window: since the last Windows reboot ({0:g}).",
@@ -169,6 +188,63 @@ internal sealed class StatusForm : Form
         }
 
         AddRiskLine("OVERALL RISK", overallRisk, RiskAssessment.Guidance(overallRisk));
+        AddSpacer();
+        AddHeading("MONITORING STATUS");
+        if (monitoringDegraded)
+        {
+            AddRiskLine("MONITORING", RiskLevel.Survivable, "A monitoring source is stale or unavailable; the device list may be outdated.");
+        }
+        else if (monitoring.LastInventorySuccessUtc is null)
+        {
+            AddLine("Starting: the first storage inventory has not completed yet.", _secondaryTextColor);
+        }
+        else
+        {
+            AddLine("Monitoring sources are current.", HealthColor(0));
+        }
+
+        AddLine($"  Inventory last attempted: {FormatTimestamp(monitoring.LastInventoryAttemptUtc)}");
+        AddLine($"  Inventory last succeeded: {FormatTimestamp(monitoring.LastInventorySuccessUtc)}");
+        if (monitoring.InventoryInProgress)
+        {
+            AddLine("  Inventory refresh is in progress.", _secondaryTextColor);
+        }
+
+        if (monitoring.InventoryIsStale(nowUtc))
+        {
+            AddLine("  Inventory is stale; displayed devices may no longer be present or healthy.", RiskColor(RiskLevel.Survivable));
+        }
+
+        if (!string.IsNullOrWhiteSpace(monitoring.InventoryIssue))
+        {
+            AddLine($"  Inventory issue: {monitoring.InventoryIssue}", RiskColor(RiskLevel.Survivable));
+        }
+
+        if (!string.IsNullOrWhiteSpace(monitoring.PnpIssue))
+        {
+            AddLine($"  PnP problem-scan issue: {monitoring.PnpIssue}", RiskColor(RiskLevel.Survivable));
+        }
+
+        AddLine(monitoring.MissingEventChannels.Count == 0
+            ? "  Required Windows event channels: subscribed."
+            : monitoring.EventChannelsAreStarting(nowUtc)
+                ? $"  Event channel subscriptions starting: {string.Join(", ", monitoring.MissingEventChannels)}"
+                : $"  Missing event channels: {string.Join(", ", monitoring.MissingEventChannels)}",
+            monitoring.MissingEventChannels.Count == 0 || monitoring.EventChannelsAreStarting(nowUtc)
+                ? _secondaryTextColor
+                : RiskColor(RiskLevel.Survivable));
+        AddLine($"  Diagnostic log last written: {FormatTimestamp(monitoring.LastDiagnosticWriteUtc)}");
+        if (monitoring.DiagnosticLogIsStale(nowUtc))
+        {
+            AddLine("  Diagnostic log has not been updated on schedule.", RiskColor(RiskLevel.Survivable));
+        }
+
+        if (!string.IsNullOrWhiteSpace(monitoring.DiagnosticLogError))
+        {
+            AddLine($"  Diagnostic log unavailable: {monitoring.DiagnosticLogError}", RiskColor(RiskLevel.Survivable));
+            AddLine($"  Log path: {monitoring.DiagnosticLogPath}", _secondaryTextColor);
+        }
+
         AddSpacer();
         AddHeading("RISK GUIDE");
         AddRiskLine(null, RiskLevel.Benign, "No active issue is currently recorded.");
@@ -220,7 +296,7 @@ internal sealed class StatusForm : Form
         }
 
         ResizeReportLines();
-        _report.AutoScrollPosition = Point.Empty;
+        _report.AutoScrollPosition = new Point(-previousScroll.X, -previousScroll.Y);
         _report.ResumeLayout(performLayout: true);
 
         var selectedId = (_incidentSelector.SelectedItem as IncidentChoice)?.Id;
@@ -242,6 +318,42 @@ internal sealed class StatusForm : Form
                 _incidentSelector.SelectedItem = selectedChoice;
             }
         }
+    }
+
+    public void RefreshMonitoringIfChanged()
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+
+        var current = _coordinator.GetMonitoringStatus();
+        var prior = _lastRenderedMonitoring;
+        var now = DateTimeOffset.UtcNow;
+        if (_displayTimeLabel is { IsDisposed: false } label)
+        {
+            // Update the visible clock without rebuilding a long incident report
+            // or throwing away the user's scroll position every timer tick.
+            label.Text = DisplayTime(now);
+        }
+        if (prior is not null &&
+            prior.LastInventoryAttemptUtc == current.LastInventoryAttemptUtc &&
+            prior.LastInventorySuccessUtc == current.LastInventorySuccessUtc &&
+            prior.InventoryInProgress == current.InventoryInProgress &&
+            prior.InventoryIssue == current.InventoryIssue &&
+            prior.PnpIssue == current.PnpIssue &&
+            prior.LastDiagnosticWriteUtc == current.LastDiagnosticWriteUtc &&
+            prior.DiagnosticLogError == current.DiagnosticLogError &&
+            prior.MissingEventChannels.SequenceEqual(current.MissingEventChannels) &&
+            _lastRenderedInventoryStale == current.InventoryIsStale(now) &&
+            _lastRenderedDiagnosticLogStale == current.DiagnosticLogIsStale(now) &&
+            _lastRenderedEventChannelsStarting == current.EventChannelsAreStarting(now) &&
+            _lastRenderedMonitoringDegraded == current.IsDegraded(now))
+        {
+            return;
+        }
+
+        RefreshStatus();
     }
 
     protected override void Dispose(bool disposing)
@@ -303,11 +415,15 @@ internal sealed class StatusForm : Form
 
     private void ClearReport()
     {
+        _displayTimeLabel = null;
         while (_report.Controls.Count > 0)
         {
             _report.Controls[0].Dispose();
         }
     }
+
+    private static string DisplayTime(DateTimeOffset nowUtc) =>
+        string.Format(CultureInfo.CurrentCulture, "Displayed: {0:g} (display time, not last inventory scan)", nowUtc.ToLocalTime());
 
     private void AddHeading(string text) => AddLine(text, _headingColor, _headingFont, 6);
 
@@ -488,6 +604,9 @@ internal sealed class StatusForm : Form
 
         return string.Format(CultureInfo.CurrentCulture, "{0:0.##} {1}", value, units[unit]);
     }
+
+    private static string FormatTimestamp(DateTimeOffset? timestamp) =>
+        timestamp?.ToLocalTime().ToString("g", CultureInfo.CurrentCulture) ?? "never";
 
     private static string HealthName(ushort value) => value switch
     {

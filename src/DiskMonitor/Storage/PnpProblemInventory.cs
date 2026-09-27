@@ -10,6 +10,8 @@ namespace DiskMonitor.Storage;
 internal sealed class PnpProblemInventory(MonitorLogger logger)
 {
     internal const string ProblemRule = "pnp.current-problem";
+    internal const string UnavailableRule = "monitor.pnp-inventory-unavailable";
+    internal const string UnavailableDeviceToken = "pnp-inventory";
 
     public IReadOnlyList<StorageObservation> Read()
     {
@@ -46,9 +48,9 @@ internal sealed class PnpProblemInventory(MonitorLogger logger)
             // A failed query must not masquerade as an empty, healthy inventory.
             observations.Add(new StorageObservation
             {
-                RuleId = "monitor.pnp-inventory-unavailable",
+                RuleId = UnavailableRule,
                 Source = "Win32_PnPEntity",
-                DeviceToken = "pnp-inventory",
+                DeviceToken = UnavailableDeviceToken,
                 Category = ObservationCategory.Health,
                 Severity = ObservationSeverity.Warning,
                 AlertMode = AlertMode.Immediate,

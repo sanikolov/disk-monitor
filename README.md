@@ -6,12 +6,14 @@ It is open-source software distributed under the [MIT License](LICENSE.txt).
 
 The first release deliberately stays user-mode and conservative:
 
-- It watches the Windows System event log for disk, storage-controller, NTFS, Plug and Play, and USB-storage events.
+- It watches the Windows System, NTFS Operational, Storage ClassPnP Operational, and available Storport Operational logs for disk, storage-controller, NTFS, Plug and Play, and USB-storage events.
+- Repeated NTFS slow-I/O warnings are reported for any disk bus, including SATA. Repeated failed non-read/write storage commands are reported without treating a rejected device probe as lost user data.
 - It refreshes the Windows storage inventory periodically and checks the health state exposed by Windows.
 - It checks present USB devices, disks, and storage controllers for Plug and Play problem codes, including descriptor failures that prevent a drive from appearing in the disk inventory. Unidentified USB devices are reported without assuming they are disks.
 - It observes the NTFS and Storport Operational channels in addition to the System channel, and detects repeated USB disappearance/reappearance through inventory diffs.
 - It opportunistically asks a physical disk whether it predicts failure. Unsupported USB bridges and drivers are treated as unavailable, not unhealthy.
 - It does not write to disks, run `chkdsk`, scan the surface, run SMART self-tests, or upload telemetry.
+- The status window shows when inventory last succeeded, which event channels or PnP checks are unavailable, and whether diagnostic logging has stopped. A heartbeat keeps the tray warning state current even when an inventory request stalls. WMI and device probes run in timeboxed child processes so a stuck driver cannot permanently block later inventory scans.
 - It runs as a standard user. The MSI is machine-wide and therefore normally requires UAC during installation.
 
 The application uses .NET 8 WinForms. The MSI is authored with WixSharp 2.x and WiX 4.

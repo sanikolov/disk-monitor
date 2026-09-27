@@ -63,7 +63,7 @@ public sealed class PnpProblemInventoryTests
     }
 
     [Fact]
-    public void PersistentFaultSurvivesExpiryAndReopensAfterManualClearWithoutPollAlertSpam()
+    public void PersistentFaultReopensAfterManualClearWithoutPollAlertSpam()
     {
         using var engine = CreateEngine();
         var alerts = 0;
@@ -75,7 +75,6 @@ public sealed class PnpProblemInventoryTests
         Assert.Equal(2, Assert.Single(engine.GetIncidents()).EvidenceCount);
 
         engine.Process(Problem(FailedUsb, now.AddDays(2)), null);
-        engine.AutoResolveStale(now.AddDays(2));
         var active = Assert.Single(engine.GetIncidents(activeOnly: true));
         engine.Resolve(active.Id);
         engine.Process(Problem(FailedUsb, now.AddDays(2).AddMinutes(1)), null);

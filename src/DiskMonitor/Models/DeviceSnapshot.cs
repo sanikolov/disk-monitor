@@ -44,6 +44,20 @@ internal sealed class StorageInventorySnapshot
     public DeviceSnapshot? FindByDriveLetter(string driveLetter) =>
         Devices.FirstOrDefault(device => device.DriveLetters.Contains(driveLetter, StringComparer.OrdinalIgnoreCase));
 
+    public DeviceSnapshot? FindUniqueBySerialNumber(string? serialNumber)
+    {
+        if (string.IsNullOrWhiteSpace(serialNumber))
+        {
+            return null;
+        }
+
+        var matches = Devices
+            .Where(device => device.SerialNumber.Equals(serialNumber, StringComparison.OrdinalIgnoreCase))
+            .Take(2)
+            .ToList();
+        return matches.Count == 1 ? matches[0] : null;
+    }
+
     // Storport names its adapter path RaidPortN; Win32_DiskDrive exposes the same
     // adapter as SCSIPort=N. This is the best standard-user correlation available.
     public DeviceSnapshot? FindByRaidPort(int raidPort)

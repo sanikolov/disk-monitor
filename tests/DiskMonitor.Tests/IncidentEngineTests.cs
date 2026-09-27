@@ -113,16 +113,16 @@ public sealed class IncidentEngineTests
     }
 
     [Fact]
-    public void StaleActiveIncidentsCanBeAutoResolved()
+    public void CurrentBootIncidentIsNotResolvedJustBecauseItIsOver24HoursOld()
     {
         var store = new InMemoryStateStore();
         var now = DateTimeOffset.UtcNow;
-        using var engine = new IncidentEngine(store, CreateLogger(), new MonitorOptions { AutoResolveAfterHours = 24 });
+        using var engine = new IncidentEngine(store, CreateLogger(), new MonitorOptions());
         engine.Process(CreateObservation(6, now.AddHours(-25), isHistorical: true), null);
 
-        engine.AutoResolveStale(now);
+        engine.ResolveBefore(now.AddDays(-7));
 
-        Assert.True(Assert.Single(engine.GetIncidents()).Resolved);
+        Assert.False(Assert.Single(engine.GetIncidents()).Resolved);
     }
 
     [Fact]
@@ -180,7 +180,7 @@ public sealed class IncidentEngineTests
             Key = "serial:usb-disk|123|usb",
             Model = "USB Disk",
             BusType = "USB"
-        });
+        }, serialIsUnique: true);
 
         var incident = Assert.Single(engine.GetIncidents());
         Assert.Equal("serial:usb-disk|123|usb", incident.DeviceKey);

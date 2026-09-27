@@ -35,6 +35,7 @@ internal sealed class StorageObservation : EventArgs
     public string Summary { get; init; } = string.Empty;
     public string Details { get; init; } = string.Empty;
     public int? DiskNumber { get; init; }
+    public string? DeviceSerialNumber { get; init; }
     public int? RaidPortNumber { get; init; }
     public string? DriveLetter { get; init; }
     public string? DeviceToken { get; init; }

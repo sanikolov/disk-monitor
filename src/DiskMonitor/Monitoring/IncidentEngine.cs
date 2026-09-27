@@ -204,45 +204,31 @@ internal sealed class IncidentEngine : IDisposable
         }
     }
 
-    public void AutoResolveStale(DateTimeOffset now)
-    {
-        var changed = false;
-        var cutoff = now - TimeSpan.FromHours(Math.Clamp(_options.AutoResolveAfterHours, 1, 24 * 30));
-
-        lock (_gate)
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            foreach (var incident in _state.Incidents.Where(incident => !incident.Resolved && incident.LastSeen < cutoff))
-            {
-                incident.Acknowledged = true;
-                incident.Resolved = true;
-                changed = true;
-            }
-
-            if (changed)
-            {
-                PruneIncidentsLocked();
-                ScheduleSaveLocked();
-            }
-        }
-
-        if (changed)
-        {
-            IncidentsChanged?.Invoke(this, EventArgs.Empty);
-        }
-    }
-
-    public void ReidentifyDevice(DeviceSnapshot device)
+    public void ReidentifyDevice(DeviceSnapshot device, bool serialIsUnique)
     {
         var changed = false;
         var fallbackKeys = new HashSet<string>(StringComparer.Ordinal)
         {
             $"disk:{device.DiskNumber}"
         };
+        string? serialKey = null;
+        if (!string.IsNullOrWhiteSpace(device.SerialNumber))
+        {
+            serialKey = $"serial:{device.SerialNumber.Trim().ToLowerInvariant()}";
+            // A disk/volume suffix disambiguates reused USB bridge serials. It
+            // is safe to match the current address even when the serial is not
+            // unique; an unsuffixed match requires uniqueness.
+            fallbackKeys.Add($"{serialKey}|disk:{device.DiskNumber}");
+            foreach (var driveLetter in device.DriveLetters)
+            {
+                fallbackKeys.Add($"{serialKey}|volume:{driveLetter.ToLowerInvariant()}");
+            }
+
+            if (serialIsUnique)
+            {
+                fallbackKeys.Add(serialKey);
+            }
+        }
         if (device.ScsiPort is not null)
         {
             fallbackKeys.Add($"raidport:{device.ScsiPort.Value}");
@@ -256,7 +242,11 @@ internal sealed class IncidentEngine : IDisposable
             }
 
             foreach (var fallback in _state.Incidents
-                         .Where(incident => !incident.Resolved && fallbackKeys.Contains(incident.DeviceKey))
+                         .Where(incident => !incident.Resolved &&
+                                            (fallbackKeys.Contains(incident.DeviceKey) ||
+                                             (serialIsUnique && serialKey is not null &&
+                                              (incident.DeviceKey.StartsWith($"{serialKey}|disk:", StringComparison.Ordinal) ||
+                                               incident.DeviceKey.StartsWith($"{serialKey}|volume:", StringComparison.Ordinal)))))
                          .ToList())
             {
                 var separator = fallback.Fingerprint.LastIndexOf('|');
@@ -445,7 +435,9 @@ internal sealed class IncidentEngine : IDisposable
     }
 
     private static string BuildFallbackDeviceKey(StorageObservation observation) =>
-        observation.DiskNumber is not null
+        !string.IsNullOrWhiteSpace(observation.DeviceSerialNumber)
+            ? BuildSerialFallbackKey(observation)
+            : observation.DiskNumber is not null
             ? $"disk:{observation.DiskNumber.Value}"
             : observation.DriveLetter is not null
                 ? $"volume:{observation.DriveLetter.ToLowerInvariant()}"
@@ -455,8 +447,30 @@ internal sealed class IncidentEngine : IDisposable
                         ? $"device:{observation.DeviceToken.ToLowerInvariant()}"
                         : "unknown";
 
+    private static string BuildSerialFallbackKey(StorageObservation observation)
+    {
+        var serialKey = $"serial:{observation.DeviceSerialNumber!.Trim().ToLowerInvariant()}";
+        // Some USB bridges reuse a serial. Preserve any available event-time
+        // volume or disk number so distinct unresolved devices stay separate.
+        return observation.DriveLetter is not null
+            ? $"{serialKey}|volume:{observation.DriveLetter.ToLowerInvariant()}"
+            : observation.DiskNumber is not null
+                ? $"{serialKey}|disk:{observation.DiskNumber.Value}"
+                : serialKey;
+    }
+
     private static string BuildFallbackDeviceName(StorageObservation observation)
     {
+        if (observation.DriveLetter is not null)
+        {
+            return $"Volume {observation.DriveLetter}";
+        }
+
+        if (!string.IsNullOrWhiteSpace(observation.DeviceSerialNumber))
+        {
+            return $"Storage device serial {observation.DeviceSerialNumber}";
+        }
+
         if (observation.DiskNumber is not null)
         {
             return $"PhysicalDrive{observation.DiskNumber.Value}";

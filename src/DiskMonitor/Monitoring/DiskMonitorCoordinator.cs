@@ -10,12 +10,15 @@ internal sealed class DiskMonitorCoordinator : IDisposable
 {
     private readonly MonitorLogger _logger;
     private readonly MonitorOptions _options;
+    private readonly DateTimeOffset _startedUtc = DateTimeOffset.UtcNow;
     private readonly DateTimeOffset _bootTimeUtc;
-    private readonly StorageInventory _inventoryReader;
-    private readonly PnpProblemInventory _pnpProblemReader;
+    private readonly HardwareProbeClient _pnpProbe = new();
+    private readonly HardwareProbeClient _inventoryProbe = new();
+    private readonly HardwareProbeClient _predictionProbe = new();
     private readonly EventLogMonitor _eventLogMonitor;
     private readonly DeviceChangeMonitor _deviceChangeMonitor;
     private readonly IncidentEngine _incidentEngine;
+    private readonly RefreshAttemptGate _refreshGate = new();
     private readonly Channel<StorageObservation> _observations = Channel.CreateUnbounded<StorageObservation>(new UnboundedChannelOptions
     {
         SingleReader = true,
@@ -27,6 +30,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
     private readonly TaskCompletionSource<bool> _inventoryReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _inventoryGate = new();
     private readonly object _deviceDebounceGate = new();
+    private readonly object _predictionGate = new();
     private readonly Dictionary<string, bool> _lastPredictionByDevice = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _predictionStatusByDevice = new(StringComparer.Ordinal);
     private readonly Dictionary<int, LastKnownDevice> _lastKnownDevicesByNumber = new();
@@ -34,6 +38,13 @@ internal sealed class DiskMonitorCoordinator : IDisposable
     private StorageInventorySnapshot _currentInventory = new();
     private CancellationTokenSource? _deviceDebounce;
     private DateTimeOffset _lastRefreshStartedAt = DateTimeOffset.MinValue;
+    private DateTimeOffset? _lastRefreshSucceededAt;
+    private string? _inventoryIssue;
+    private string? _pnpIssue;
+    private bool _refreshInProgress;
+    private (StorageInventorySnapshot Snapshot, long Generation)? _pendingPrediction;
+    private long _predictionGeneration;
+    private bool _predictionLoopRunning;
     private bool _disposed;
 
     public DiskMonitorCoordinator(
@@ -45,8 +56,6 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         _logger = logger;
         _options = options;
         _bootTimeUtc = bootTimeUtc ?? SystemBootTime.GetUtc();
-        _inventoryReader = new StorageInventory(logger);
-        _pnpProblemReader = new PnpProblemInventory(logger);
         _eventLogMonitor = new EventLogMonitor(logger, _bootTimeUtc);
         _deviceChangeMonitor = new DeviceChangeMonitor();
         _incidentEngine = new IncidentEngine(stateStore, logger, options);
@@ -60,6 +69,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
 
     public event EventHandler<IncidentRaisedEventArgs>? AlertRaised;
     public event EventHandler? IncidentsChanged;
+    public event EventHandler? MonitoringChanged;
     public event EventHandler<ShutdownRequestedEventArgs>? ShutdownRequested;
 
     public DateTimeOffset BootTimeUtc => _bootTimeUtc;
@@ -79,6 +89,44 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         }
     }
 
+    public MonitorStatusSnapshot GetMonitoringStatus()
+    {
+        DateTimeOffset? lastAttempt;
+        DateTimeOffset? lastSuccess;
+        string? inventoryIssue;
+        string? pnpIssue;
+        bool inProgress;
+        lock (_inventoryGate)
+        {
+            lastAttempt = _lastRefreshStartedAt == DateTimeOffset.MinValue ? null : _lastRefreshStartedAt;
+            lastSuccess = _lastRefreshSucceededAt;
+            inventoryIssue = _inventoryIssue;
+            pnpIssue = _pnpIssue;
+            inProgress = _refreshInProgress;
+        }
+
+        var log = _logger.GetHealth();
+        return new MonitorStatusSnapshot
+        {
+            StartedUtc = _startedUtc,
+            LastInventoryAttemptUtc = lastAttempt,
+            LastInventorySuccessUtc = lastSuccess,
+            InventoryInProgress = inProgress,
+            InventoryIssue = inventoryIssue,
+            PnpIssue = pnpIssue,
+            InventoryTimeout = TimeSpan.FromSeconds(Math.Clamp(_options.InventoryRefreshTimeoutSeconds, 15, 300)),
+            MaximumInventoryAge = TimeSpan.FromMinutes(Math.Clamp(_options.PollIntervalMinutes, 5, 1440)) +
+                                  TimeSpan.FromSeconds(Math.Clamp(_options.InventoryRefreshTimeoutSeconds, 15, 300)) +
+                                  TimeSpan.FromMinutes(1),
+            MissingEventChannels = _eventLogMonitor.GetMissingRequiredChannels(),
+            EventChannelStartupGrace = TimeSpan.FromSeconds(30),
+            LastDiagnosticWriteUtc = log.LastSuccessfulWriteUtc,
+            MaximumDiagnosticLogAge = TimeSpan.FromMinutes(Math.Clamp(_options.MonitoringHeartbeatMinutes, 1, 60) + 1),
+            DiagnosticLogError = log.LastWriteError,
+            DiagnosticLogPath = _logger.LogFile
+        };
+    }
+
     public string GetPredictionStatus(string deviceKey)
     {
         lock (_inventoryGate)
@@ -96,9 +144,11 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         _eventLogMonitor.Start();
         _ = Task.Run(ProcessObservationsAsync);
         _ = Task.Run(RefreshLoopAsync);
+        _ = Task.Run(MonitoringHeartbeatAsync);
+        _ = Task.Run(RecoverEventWatchersAsync);
     }
 
-    public void CheckNow() => RequestRefresh(bypassMinimum: true);
+    public void CheckNow() => RequestRefresh();
 
     public void Acknowledge(string incidentId) => _incidentEngine.Acknowledge(incidentId);
 
@@ -116,6 +166,9 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         _observations.Writer.TryComplete();
         _eventLogMonitor.Dispose();
         _deviceChangeMonitor.Dispose();
+        _pnpProbe.Dispose();
+        _inventoryProbe.Dispose();
+        _predictionProbe.Dispose();
         lock (_deviceDebounceGate)
         {
             _deviceDebounce?.Cancel();
@@ -153,9 +206,9 @@ internal sealed class DiskMonitorCoordinator : IDisposable
 
     private void OnAlertRaised(object? sender, IncidentRaisedEventArgs args) => AlertRaised?.Invoke(this, args);
 
-    private void OnIncidentsChanged(object? sender, EventArgs args) => IncidentsChanged?.Invoke(this, args);
+    private void OnIncidentsChanged(object? sender, EventArgs args) => NotifyIncidentsChanged();
 
-    private void RequestRefresh(bool bypassMinimum = false)
+    private void RequestRefresh()
     {
         if (_disposed)
         {
@@ -183,13 +236,21 @@ internal sealed class DiskMonitorCoordinator : IDisposable
             await _inventoryReady.Task.WaitAsync(_shutdown.Token).ConfigureAwait(false);
             await foreach (var observation in _observations.Reader.ReadAllAsync(_shutdown.Token))
             {
-                DeviceSnapshot? device;
-                lock (_inventoryGate)
+                try
                 {
-                    device = FindDeviceForObservationLocked(observation);
-                }
+                    DeviceSnapshot? device;
+                    lock (_inventoryGate)
+                    {
+                        device = FindDeviceForObservationLocked(observation);
+                    }
 
-                _incidentEngine.Process(observation, device);
+                    _incidentEngine.Process(observation, device);
+                }
+                catch (Exception ex)
+                {
+                    // One malformed event or persistence failure must not stop all later alerts.
+                    _logger.Error($"Storage observation processing failed: source={observation.Source}; channel={observation.Channel}; event={observation.EventId}; record={observation.EventRecordId}; rule={observation.RuleId}.", ex);
+                }
             }
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
@@ -203,23 +264,22 @@ internal sealed class DiskMonitorCoordinator : IDisposable
 
     private async Task RefreshLoopAsync()
     {
-        try
+        var firstRefresh = true;
+        while (!_shutdown.IsCancellationRequested)
         {
-            var initialRefresh = InitialRefreshAsync();
-            var initialTimeout = Task.Delay(
-                TimeSpan.FromSeconds(Math.Clamp(_options.InitialInventoryTimeoutSeconds, 5, 120)),
-                _shutdown.Token);
-            await Task.WhenAny(initialRefresh, initialTimeout).ConfigureAwait(false);
-            _inventoryReady.TrySetResult(true);
-            if (!initialRefresh.IsCompleted)
+            try
             {
-                _logger.Warn("Initial storage inventory is taking longer than expected; event monitoring will continue with best-effort device attribution.");
-            }
+                if (firstRefresh)
+                {
+                    await WaitForRefreshAttemptAsync(
+                        TimeSpan.FromSeconds(Math.Clamp(_options.InitialInventoryTimeoutSeconds, 5, 120)))
+                        .ConfigureAwait(false);
+                    // Events can use serial/volume attribution even if WMI is stuck.
+                    _inventoryReady.TrySetResult(true);
+                    firstRefresh = false;
+                    continue;
+                }
 
-            await initialRefresh.ConfigureAwait(false);
-
-            while (!_shutdown.IsCancellationRequested)
-            {
                 _ = await _refreshSignal.WaitAsync(
                     TimeSpan.FromMinutes(Math.Clamp(_options.PollIntervalMinutes, 5, 1440)),
                     _shutdown.Token).ConfigureAwait(false);
@@ -228,7 +288,50 @@ internal sealed class DiskMonitorCoordinator : IDisposable
                     return;
                 }
 
-                await RefreshAsync().ConfigureAwait(false);
+                await WaitForRefreshAttemptAsync(
+                    TimeSpan.FromSeconds(Math.Clamp(_options.InventoryRefreshTimeoutSeconds, 15, 300)))
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                _inventoryReady.TrySetResult(true);
+                MarkInventoryIssue($"Storage refresh loop failed: {ex.GetType().Name}: {ex.Message}");
+                _logger.Error("The storage refresh loop failed; it will retry.", ex);
+                try
+                {
+                    await Task.Delay(
+                        TimeSpan.FromSeconds(Math.Clamp(_options.MinimumTopologyRefreshSeconds, 5, 300)),
+                        _shutdown.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    private async Task WaitForRefreshAttemptAsync(TimeSpan timeout)
+    {
+        try
+        {
+            // The child is given the full hardware timeout. The extra interval
+            // lets the parent confirm termination before declaring its own wait
+            // stalled; a timed-out worker must never overlap its replacement.
+            var outcome = await _refreshGate.RunAsync(
+                () => RefreshAsync(timeout), timeout + TimeSpan.FromSeconds(10), _shutdown.Token).ConfigureAwait(false);
+            switch (outcome)
+            {
+                case RefreshAttemptOutcome.TimedOut:
+                    MarkInventoryIssue($"Storage inventory exceeded its {timeout.TotalSeconds:0}-second wait; the current probe is still running.");
+                    break;
+                case RefreshAttemptOutcome.StillRunning:
+                    MarkInventoryIssue($"The previous storage inventory is still running after {timeout.TotalSeconds:0} seconds.");
+                    break;
             }
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
@@ -236,81 +339,264 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         }
         catch (Exception ex)
         {
-            _logger.Error("The storage refresh loop stopped unexpectedly.", ex);
+            MarkInventoryIssue($"Storage inventory attempt failed: {ex.GetType().Name}: {ex.Message}");
+            _logger.Error("Storage inventory attempt failed; later refreshes will continue.", ex);
         }
     }
 
-    private async Task InitialRefreshAsync()
+    private async Task MonitoringHeartbeatAsync()
     {
         try
         {
-            await RefreshAsync().ConfigureAwait(false);
+            while (!_shutdown.IsCancellationRequested)
+            {
+                await Task.Delay(
+                    TimeSpan.FromMinutes(Math.Clamp(_options.MonitoringHeartbeatMinutes, 1, 60)),
+                    _shutdown.Token).ConfigureAwait(false);
+                try
+                {
+                    var status = GetMonitoringStatus();
+                    _logger.Info($"Monitoring heartbeat: process={Environment.ProcessId}; boot={_bootTimeUtc:O}; inventoryAttempt={status.LastInventoryAttemptUtc:O}; inventorySuccess={status.LastInventorySuccessUtc:O}; inventoryInProgress={status.InventoryInProgress}; inventoryIssue={status.InventoryIssue ?? "none"}; pnpIssue={status.PnpIssue ?? "none"}; missingEventChannels={string.Join(",", status.MissingEventChannels)}; logPath={status.DiagnosticLogPath}.");
+                    NotifyMonitoringChanged();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("The monitoring heartbeat failed; it will retry.", ex);
+                }
+            }
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
         }
-        catch (Exception ex)
+    }
+
+    private async Task RecoverEventWatchersAsync()
+    {
+        try
         {
-            _logger.Error("The initial storage inventory refresh failed; event monitoring will continue.", ex);
+            while (!_shutdown.IsCancellationRequested)
+            {
+                await Task.Delay(
+                    TimeSpan.FromMinutes(Math.Clamp(_options.MonitoringHeartbeatMinutes, 1, 60)),
+                    _shutdown.Token).ConfigureAwait(false);
+                try
+                {
+                    // Subscription setup may block in Windows. Keep it off the
+                    // heartbeat path so stale coverage is still reported.
+                    _eventLogMonitor.RetryMissingRequiredChannels();
+                    NotifyMonitoringChanged();
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error("Event-log subscription recovery failed; it will retry.", ex);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+        {
         }
     }
 
-    private async Task RefreshAsync()
+    private void MarkInventoryIssue(string issue)
+    {
+        DateTimeOffset lastAttempt;
+        lock (_inventoryGate)
+        {
+            _inventoryIssue = issue;
+            lastAttempt = _lastRefreshStartedAt;
+        }
+
+        _logger.Warn($"Storage monitoring degraded: process={Environment.ProcessId}; issue={issue}; lastAttempt={lastAttempt:O}.");
+        NotifyMonitoringChanged();
+    }
+
+    private void NotifyMonitoringChanged()
+    {
+        try
+        {
+            MonitoringChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception ex)
+        {
+            // A UI subscriber must not stop the monitoring or heartbeat loops.
+            _logger.Error("A monitoring-status subscriber failed.", ex);
+        }
+    }
+
+    private void NotifyIncidentsChanged()
+    {
+        try
+        {
+            IncidentsChanged?.Invoke(this, EventArgs.Empty);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"Incident-status subscriber failed: process={Environment.ProcessId}.", ex);
+        }
+    }
+
+    private async Task RefreshAsync(TimeSpan hardwareTimeout)
     {
         lock (_inventoryGate)
         {
             _lastRefreshStartedAt = DateTimeOffset.UtcNow;
+            _refreshInProgress = true;
         }
+
+        NotifyMonitoringChanged();
 
         StorageInventorySnapshot snapshot;
         try
         {
-            // Evaluate current PnP failures even at startup and even if disk
-            // enumeration later fails. Re-observe persistent faults so reboot,
-            // manual clearing, or stale-incident expiry cannot hide them.
-            var problems = await Task.Run(_pnpProblemReader.Read, _shutdown.Token).ConfigureAwait(false);
-            foreach (var problem in problems)
+            // PnP and disk enumeration use separate children. A hung disk provider
+            // cannot discard already retrieved PnP faults, and neither call can
+            // hold the tray process indefinitely.
+            var pnpTask = _pnpProbe.RunPnpAsync(
+                TimeSpan.FromSeconds(Math.Clamp(_options.PnpRefreshTimeoutSeconds, 5, 60)),
+                _shutdown.Token);
+            var inventoryTask = _inventoryProbe.RunInventoryAsync(hardwareTimeout, _shutdown.Token);
+            await ObservePnpProblemsAsync(pnpTask).ConfigureAwait(false);
+            var probe = await inventoryTask.ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(probe.WorkerLogError))
             {
-                _incidentEngine.Process(problem, null);
+                _logger.Warn($"Hardware inventory worker could not write its diagnostic log: process={Environment.ProcessId}; error={probe.WorkerLogError}.");
             }
-            snapshot = await Task.Run(_inventoryReader.Read, _shutdown.Token).ConfigureAwait(false);
+            snapshot = probe.Inventory;
+
+            if (!snapshot.IsReliable)
+            {
+                MarkInventoryIssue("Windows returned no reliable storage inventory; the previous device snapshot was retained.");
+                return;
+            }
+
+            StorageInventorySnapshot previous;
+            lock (_inventoryGate)
+            {
+                previous = _currentInventory;
+                _currentInventory = snapshot;
+                foreach (var device in snapshot.Devices)
+                {
+                    if (device.DiskNumber >= 0)
+                    {
+                        _lastKnownDevicesByNumber[device.DiskNumber] = new LastKnownDevice(device, DateTimeOffset.UtcNow);
+                    }
+                }
+            }
+
+            ObserveUsbFlapping(previous, snapshot, DateTimeOffset.UtcNow);
+            foreach (var device in snapshot.Devices)
+            {
+                var serialIsUnique = ReferenceEquals(snapshot.FindUniqueBySerialNumber(device.SerialNumber), device);
+                _incidentEngine.ReidentifyDevice(device, serialIsUnique);
+                var priorDevice = previous.FindByDiskNumber(device.DiskNumber);
+                EnqueueHealthObservations(device, priorDevice);
+            }
+
+            lock (_inventoryGate)
+            {
+                _lastRefreshSucceededAt = DateTimeOffset.UtcNow;
+                _inventoryIssue = null;
+            }
+
+            NotifyIncidentsChanged();
+            // Prediction is independent of inventory freshness. A newer scan
+            // supersedes old prediction work, but the single worker loop still
+            // confirms termination of its current child before replacing it.
+            SchedulePrediction(snapshot);
         }
         catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
-            return;
         }
-
-        if (!snapshot.IsReliable)
+        catch (Exception ex)
         {
-            _logger.Warn("Windows returned no reliable storage inventory; retaining the previous snapshot and skipping health/flapping decisions.");
-            return;
+            MarkInventoryIssue($"Storage inventory failed: {ex.GetType().Name}: {ex.Message}");
+            _logger.Error("Storage inventory refresh failed; later refreshes will continue.", ex);
         }
-
-        StorageInventorySnapshot previous;
-        lock (_inventoryGate)
+        finally
         {
-            previous = _currentInventory;
-            _currentInventory = snapshot;
-            foreach (var device in snapshot.Devices)
+            lock (_inventoryGate)
             {
-                if (device.DiskNumber >= 0)
+                _refreshInProgress = false;
+            }
+
+            NotifyMonitoringChanged();
+        }
+    }
+
+    private async Task ObservePnpProblemsAsync(Task<HardwarePnpProbeResult> pnpTask)
+    {
+        try
+        {
+            var probe = await pnpTask.ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(probe.WorkerLogError))
+            {
+                _logger.Warn($"PnP worker could not write its diagnostic log: process={Environment.ProcessId}; error={probe.WorkerLogError}.");
+            }
+
+            var coverageFailure = probe.PnpProblems.FirstOrDefault(problem =>
+                problem.RuleId == PnpProblemInventory.UnavailableRule);
+            SetPnpIssue(coverageFailure?.Details);
+            if (coverageFailure is null)
+            {
+                // A confirmed healthy PnP query closes only the monitor-coverage
+                // incident. It does not resolve any actual device problem code.
+                var fingerprint = $"device:{PnpProblemInventory.UnavailableDeviceToken}|{PnpProblemInventory.UnavailableRule}";
+                foreach (var incident in _incidentEngine.GetIncidents(activeOnly: true)
+                             .Where(incident => incident.Fingerprint == fingerprint))
                 {
-                    _lastKnownDevicesByNumber[device.DiskNumber] = new LastKnownDevice(device, DateTimeOffset.UtcNow);
+                    _incidentEngine.Resolve(incident.Id);
+                }
+            }
+            foreach (var problem in probe.PnpProblems)
+            {
+                try
+                {
+                    _incidentEngine.Process(problem, null);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Error($"PnP observation processing failed: process={Environment.ProcessId}; rule={problem.RuleId}; device={problem.DeviceToken}.", ex);
                 }
             }
         }
-
-        ObserveUsbFlapping(previous, snapshot, DateTimeOffset.UtcNow);
-        foreach (var device in snapshot.Devices)
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
-            _incidentEngine.ReidentifyDevice(device);
-            var priorDevice = previous.FindByDiskNumber(device.DiskNumber);
-            EnqueueHealthObservations(device, priorDevice);
+        }
+        catch (Exception ex)
+        {
+            var issue = $"PnP problem scan failed: {ex.GetType().Name}: {ex.Message}";
+            SetPnpIssue(issue);
+            _logger.Warn($"PnP problem scan failed: process={Environment.ProcessId}; coverage=USB/disk/controller problem codes.", ex);
+            try
+            {
+                _incidentEngine.Process(new StorageObservation
+                {
+                    Timestamp = DateTimeOffset.UtcNow,
+                    Source = "HardwareProbeWorker",
+                    RuleId = PnpProblemInventory.UnavailableRule,
+                    DeviceToken = PnpProblemInventory.UnavailableDeviceToken,
+                    Category = ObservationCategory.Health,
+                    Severity = ObservationSeverity.Warning,
+                    AlertMode = AlertMode.Immediate,
+                    Summary = "USB and disk device problem checks are unavailable.",
+                    Details = issue
+                }, null);
+            }
+            catch (Exception observationError)
+            {
+                _logger.Error($"PnP coverage warning could not be recorded: process={Environment.ProcessId}.", observationError);
+            }
+        }
+    }
+
+    private void SetPnpIssue(string? issue)
+    {
+        lock (_inventoryGate)
+        {
+            _pnpIssue = issue;
         }
 
-        await ProbeFailurePredictionAsync(snapshot).ConfigureAwait(false);
-        _incidentEngine.AutoResolveStale(DateTimeOffset.UtcNow);
-        IncidentsChanged?.Invoke(this, EventArgs.Empty);
+        NotifyMonitoringChanged();
     }
 
     private void EnqueueHealthObservations(DeviceSnapshot device, DeviceSnapshot? previous)
@@ -349,60 +635,156 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         }
     }
 
-    private async Task ProbeFailurePredictionAsync(StorageInventorySnapshot snapshot)
+    private void SchedulePrediction(StorageInventorySnapshot snapshot)
     {
-        foreach (var device in snapshot.Devices)
+        bool startLoop;
+        lock (_predictionGate)
         {
-            if (_shutdown.IsCancellationRequested)
+            _pendingPrediction = (snapshot, ++_predictionGeneration);
+            startLoop = !_predictionLoopRunning;
+            _predictionLoopRunning = true;
+        }
+
+        try
+        {
+            foreach (var device in snapshot.Devices)
             {
-                return;
+                SetPredictionStatus(device, device.IsUsb
+                    ? "Skipped (USB bridge; telemetry only)"
+                    : "Pending (current inventory not yet checked)", notify: false);
+            }
+            NotifyIncidentsChanged();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"Prediction status could not be queued: process={Environment.ProcessId}.", ex);
+        }
+
+        if (startLoop)
+        {
+            _ = RunPendingPredictionsAsync();
+        }
+    }
+
+    private async Task RunPendingPredictionsAsync()
+    {
+        while (!_shutdown.IsCancellationRequested)
+        {
+            (StorageInventorySnapshot Snapshot, long Generation) next;
+            lock (_predictionGate)
+            {
+                if (_pendingPrediction is not { } pending)
+                {
+                    _predictionLoopRunning = false;
+                    return;
+                }
+
+                next = pending;
+                _pendingPrediction = null;
             }
 
-            try
+            await ProbeFailurePredictionAsync(next.Snapshot, next.Generation).ConfigureAwait(false);
+        }
+
+        lock (_predictionGate)
+        {
+            _predictionLoopRunning = false;
+        }
+    }
+
+    private bool IsCurrentPrediction(long generation)
+    {
+        lock (_predictionGate)
+        {
+            return generation == _predictionGeneration;
+        }
+    }
+
+    private async Task ProbeFailurePredictionAsync(StorageInventorySnapshot snapshot, long generation)
+    {
+        try
+        {
+            foreach (var device in snapshot.Devices)
             {
-                if (device.IsUsb)
+                if (_shutdown.IsCancellationRequested || !IsCurrentPrediction(generation))
                 {
-                    SetPredictionStatus(device, "Skipped (USB bridge; telemetry only)");
-                    continue;
+                    return;
                 }
 
-                if (!NativeStorage.TryPredictFailure(device.DiskNumber, out var predictsFailure, out var errorCode))
+                try
                 {
-                    SetPredictionStatus(device, PredictionFailureStatus(errorCode));
-                    continue;
-                }
-
-                bool previousPrediction;
-                lock (_inventoryGate)
-                {
-                    previousPrediction = _lastPredictionByDevice.TryGetValue(device.Key, out var previousValue) && previousValue;
-                    _lastPredictionByDevice[device.Key] = predictsFailure;
-                }
-                SetPredictionStatus(device, predictsFailure
-                    ? "Supported (failure predicted)"
-                    : "Supported (no failure predicted)");
-
-                if (predictsFailure && !previousPrediction)
-                {
-                    _observations.Writer.TryWrite(new StorageObservation
+                    if (device.IsUsb)
                     {
-                        Timestamp = DateTimeOffset.UtcNow,
-                        RuleId = "health.predictive-failure",
-                        Category = ObservationCategory.Health,
-                        Severity = ObservationSeverity.Critical,
-                        AlertMode = AlertMode.Immediate,
-                        Summary = "The storage device predicts a failure.",
-                        Details = "Windows' storage failure-prediction request reported a predicted device failure.",
-                        DiskNumber = device.DiskNumber
-                    });
+                        SetPredictionStatus(device, "Skipped (USB bridge; telemetry only)");
+                        continue;
+                    }
+
+                    if (device.DiskNumber < 0)
+                    {
+                        SetPredictionStatus(device, "Unavailable (disk number unknown)");
+                        continue;
+                    }
+
+                    var result = await _predictionProbe.RunPredictionAsync(
+                        device.DiskNumber,
+                        TimeSpan.FromSeconds(Math.Clamp(_options.PredictionTimeoutSeconds, 5, 60)),
+                        _shutdown.Token).ConfigureAwait(false);
+                    if (!IsCurrentPrediction(generation))
+                    {
+                        return;
+                    }
+                    if (!result.Supported)
+                    {
+                        SetPredictionStatus(device, PredictionFailureStatus(result.ErrorCode));
+                        continue;
+                    }
+
+                    bool previousPrediction;
+                    lock (_inventoryGate)
+                    {
+                        previousPrediction = _lastPredictionByDevice.TryGetValue(device.Key, out var previousValue) && previousValue;
+                        _lastPredictionByDevice[device.Key] = result.PredictsFailure;
+                    }
+                    SetPredictionStatus(device, result.PredictsFailure
+                        ? "Supported (failure predicted)"
+                        : "Supported (no failure predicted)");
+
+                    if (result.PredictsFailure && !previousPrediction)
+                    {
+                        _observations.Writer.TryWrite(new StorageObservation
+                        {
+                            Timestamp = DateTimeOffset.UtcNow,
+                            RuleId = "health.predictive-failure",
+                            Category = ObservationCategory.Health,
+                            Severity = ObservationSeverity.Critical,
+                            AlertMode = AlertMode.Immediate,
+                            Summary = "The storage device predicts a failure.",
+                            Details = "Windows' storage failure-prediction request reported a predicted device failure.",
+                            DiskNumber = device.DiskNumber
+                        });
+                    }
+                }
+                catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    if (!IsCurrentPrediction(generation))
+                    {
+                        return;
+                    }
+
+                    SetPredictionStatus(device, $"Unavailable ({ex.GetType().Name})");
+                    _logger.Warn($"Failure-prediction probe failed: process={Environment.ProcessId}; disk={device.DiskNumber}; device={device.DisplayName}; key={device.Key}.", ex);
                 }
             }
-            catch (Exception ex)
-            {
-                SetPredictionStatus(device, $"Unavailable (query exception: {ex.GetType().Name})");
-            }
-
-            await Task.Yield();
+        }
+        catch (Exception ex)
+        {
+            // This task is intentionally independent of inventory freshness; it
+            // must observe its own failure instead of becoming an unobserved task.
+            _logger.Error($"Failure-prediction cycle failed: process={Environment.ProcessId}.", ex);
         }
     }
 
@@ -446,20 +828,49 @@ internal sealed class DiskMonitorCoordinator : IDisposable
 
     private DeviceSnapshot? FindDeviceForObservationLocked(StorageObservation observation)
     {
+        var serial = observation.DeviceSerialNumber;
+        if (!string.IsNullOrWhiteSpace(serial))
+        {
+            // Disk numbers are ephemeral, especially for USB devices. A unique serial
+            // from the event is stronger evidence than the current disk number.
+            var match = _currentInventory.FindUniqueBySerialNumber(serial);
+            if (match is not null)
+            {
+                return match;
+            }
+        }
+
+        bool CompatibleSerial(DeviceSnapshot candidate) =>
+            string.IsNullOrWhiteSpace(serial) ||
+            string.IsNullOrWhiteSpace(candidate.SerialNumber) ||
+            candidate.SerialNumber.Equals(serial, StringComparison.OrdinalIgnoreCase);
+
         DeviceSnapshot? device = null;
         if (observation.DiskNumber is not null)
         {
             device = _currentInventory.FindByDiskNumber(observation.DiskNumber.Value);
+            if (device is not null && !CompatibleSerial(device))
+            {
+                device = null;
+            }
         }
 
         if (device is null && observation.DriveLetter is not null)
         {
             device = _currentInventory.FindByDriveLetter(observation.DriveLetter);
+            if (device is not null && !CompatibleSerial(device))
+            {
+                device = null;
+            }
         }
 
         if (device is null && observation.RaidPortNumber is not null)
         {
             device = _currentInventory.FindByRaidPort(observation.RaidPortNumber.Value);
+            if (device is not null && !CompatibleSerial(device))
+            {
+                device = null;
+            }
         }
 
         if (device is not null || observation.DiskNumber is null)
@@ -468,6 +879,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         }
 
         if (_lastKnownDevicesByNumber.TryGetValue(observation.DiskNumber.Value, out var lastKnown) &&
+            CompatibleSerial(lastKnown.Device) &&
             DateTimeOffset.UtcNow - lastKnown.SeenAt <= TimeSpan.FromMinutes(Math.Clamp(_options.DeviceNameGraceMinutes, 1, 240)))
         {
             return lastKnown.Device;
@@ -550,7 +962,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         }
     }
 
-    private void SetPredictionStatus(DeviceSnapshot device, string status)
+    private void SetPredictionStatus(DeviceSnapshot device, string status, bool notify = true)
     {
         var changed = false;
         lock (_inventoryGate)
@@ -566,7 +978,10 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         if (changed)
         {
             _logger.Info($"Failure prediction for {device.DisplayName}: {status}.");
-            IncidentsChanged?.Invoke(this, EventArgs.Empty);
+            if (notify)
+            {
+                NotifyIncidentsChanged();
+            }
         }
     }
 
