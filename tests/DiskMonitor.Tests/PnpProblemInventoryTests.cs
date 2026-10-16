@@ -41,6 +41,34 @@ public sealed class PnpProblemInventoryTests
     }
 
     [Theory]
+    [InlineData("USB", "PCI\\VEN_1106&DEV_3483\\CONTROLLER")]
+    [InlineData("USB", FailedUsb)]
+    [InlineData("DiskDrive", "USBSTOR\\DISK\\DRIVE")]
+    [InlineData("SCSIAdapter", "PCI\\STORAGE")]
+    [InlineData("HDC", "PCI\\STORAGE")]
+    public void UserDisabledDevicesDoNotProduceHardwareFaultObservations(string deviceClass, string id)
+    {
+        var observation = PnpProblemInventory.CreateObservation(
+            id, "Intentionally disabled device", deviceClass, true, 22, DateTimeOffset.UtcNow);
+
+        Assert.Null(observation);
+    }
+
+    [Theory]
+    [InlineData(10)]
+    [InlineData(28)]
+    [InlineData(43)]
+    public void UsbControllerFailuresOtherThanUserDisabledRemainErrors(uint problemCode)
+    {
+        var observation = PnpProblemInventory.CreateObservation(
+            "PCI\\VEN_1106&DEV_3483\\CONTROLLER", "USB controller", "USB", true, problemCode, DateTimeOffset.UtcNow);
+
+        Assert.NotNull(observation);
+        Assert.Equal(ObservationSeverity.Error, observation.Severity);
+        Assert.Equal(AlertMode.Immediate, observation.AlertMode);
+    }
+
+    [Theory]
     [InlineData("DiskDrive")]
     [InlineData("SCSIAdapter")]
     [InlineData("HDC")]

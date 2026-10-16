@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <AnalysisLevel>latest-recommended</AnalysisLevel>
-    <DiskMonitorVersion>1.0.2.0</DiskMonitorVersion>
+    <DiskMonitorVersion>1.0.3.0</DiskMonitorVersion>
     <Version>$(DiskMonitorVersion)</Version>
     <AssemblyVersion>$(DiskMonitorVersion)</AssemblyVersion>
     <FileVersion>$(DiskMonitorVersion)</FileVersion>

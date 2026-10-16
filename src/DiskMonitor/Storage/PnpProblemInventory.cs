@@ -28,12 +28,20 @@ internal sealed class PnpProblemInventory(MonitorLogger logger)
             {
                 using (item)
                 {
+                    var problemCode = Convert.ToUInt32(item["ConfigManagerErrorCode"], System.Globalization.CultureInfo.InvariantCulture);
+                    if (problemCode == 22)
+                    {
+                        // CM_PROB_DISABLED records an intentional configuration,
+                        // not a failed USB transaction or storage request.
+                        logger.Info($"PnP device disabled; not reported as a fault: observed={now:O}; instance={item["PNPDeviceID"]}; device={item["Name"]}; ConfigManagerErrorCode=22.");
+                    }
+
                     var observation = CreateObservation(
                         item["PNPDeviceID"]?.ToString() ?? string.Empty,
                         item["Name"]?.ToString() ?? string.Empty,
                         item["PNPClass"]?.ToString() ?? string.Empty,
                         item["Present"] is true,
-                        Convert.ToUInt32(item["ConfigManagerErrorCode"], System.Globalization.CultureInfo.InvariantCulture),
+                        problemCode,
                         now);
                     if (observation is not null)
                     {
@@ -72,8 +80,9 @@ internal sealed class PnpProblemInventory(MonitorLogger logger)
                       deviceClass.Equals("SCSIAdapter", StringComparison.OrdinalIgnoreCase) ||
                       deviceClass.Equals("HDC", StringComparison.OrdinalIgnoreCase);
         // Windows retains disconnected devices indefinitely. Only present failed
-        // nodes are evidence of a current fault; unrelated devices are out of scope.
-        if (!present || problemCode == 0 || (!usb && !storage) || string.IsNullOrWhiteSpace(instanceId))
+        // nodes are evidence of a current fault; code 22 means the user disabled
+        // the device, and unrelated devices are out of scope.
+        if (!present || problemCode is 0 or 22 || (!usb && !storage) || string.IsNullOrWhiteSpace(instanceId))
         {
             return null;
         }
