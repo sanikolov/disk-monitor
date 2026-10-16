@@ -117,7 +117,7 @@ internal sealed class IncidentEngine : IDisposable
             {
                 Timestamp = observation.Timestamp,
                 Summary = observation.Summary,
-                Details = observation.Details,
+                Details = StorageEventTelemetry.DescribeEvidence(observation, device),
                 EventId = observation.EventId,
                 EventRecordId = observation.EventRecordId
             });

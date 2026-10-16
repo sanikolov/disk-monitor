@@ -8,4 +8,5 @@ internal static class AppPaths
 
     public static string StateFile => Path.Combine(DataDirectory, "state.json");
     public static string LogFile => Path.Combine(DataDirectory, "monitor.log");
+    public static string StorageEventLogFile => Path.Combine(DataDirectory, "storage-events.log");
 }

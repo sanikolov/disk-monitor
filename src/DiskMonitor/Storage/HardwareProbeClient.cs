@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using DiskMonitor.Infrastructure;
 
 namespace DiskMonitor.Storage;
 
@@ -15,18 +16,20 @@ internal sealed class HardwareProbeClient : IDisposable
     private static readonly TimeSpan KillWait = TimeSpan.FromSeconds(5);
 
     private readonly Func<string, int?, ProcessStartInfo> _startInfoFactory;
+    private readonly MonitorLogger? _logger;
     private readonly SemaphoreSlim _runGate = new(1, 1);
     private readonly object _processGate = new();
     private Process? _activeProcess;
     private bool _disposed;
 
-    public HardwareProbeClient() : this(CreateStartInfo)
+    public HardwareProbeClient(MonitorLogger? logger = null) : this(CreateStartInfo, logger)
     {
     }
 
-    internal HardwareProbeClient(Func<string, int?, ProcessStartInfo> startInfoFactory)
+    internal HardwareProbeClient(Func<string, int?, ProcessStartInfo> startInfoFactory, MonitorLogger? logger = null)
     {
         _startInfoFactory = startInfoFactory;
+        _logger = logger;
     }
 
     public Task<HardwarePnpProbeResult> RunPnpAsync(TimeSpan timeout, CancellationToken cancellationToken) =>
@@ -78,6 +81,9 @@ internal sealed class HardwareProbeClient : IDisposable
     {
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(timeout, TimeSpan.Zero);
         await _runGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var startedUtc = DateTimeOffset.UtcNow;
+        var elapsed = Stopwatch.StartNew();
+        int? workerId = null;
         try
         {
             ThrowIfDisposed();
@@ -112,7 +118,8 @@ internal sealed class HardwareProbeClient : IDisposable
                 throw;
             }
 
-            var workerId = process.Id;
+            workerId = process.Id;
+            _logger?.Info($"Hardware probe started: command={command}; disk={diskNumber}; parentProcess={Environment.ProcessId}; workerProcess={workerId}; startedUtc={startedUtc:O}.");
 
             using var readCancellation = new CancellationTokenSource();
             var outputTask = ReadBoundedAsync(process.StandardOutput, MaximumOutputCharacters, readCancellation.Token);
@@ -142,6 +149,7 @@ internal sealed class HardwareProbeClient : IDisposable
             var error = await errorTask.ConfigureAwait(false);
             var exitCode = process.ExitCode;
             await StopActiveProcessAsync(killIfRunning: false).ConfigureAwait(false);
+            _logger?.Info($"Hardware probe exited: command={command}; disk={diskNumber}; workerProcess={workerId}; startedUtc={startedUtc:O}; elapsedMs={elapsed.ElapsedMilliseconds}; exitCode={exitCode}.");
             if (exitCode != 0)
             {
                 throw new InvalidOperationException(
@@ -150,6 +158,11 @@ internal sealed class HardwareProbeClient : IDisposable
 
             return JsonSerializer.Deserialize<T>(output)
                 ?? throw new InvalidDataException($"Hardware probe worker returned no result: command={command}; process={workerId}.");
+        }
+        catch (Exception ex)
+        {
+            _logger?.Warn($"Hardware probe did not complete successfully: command={command}; disk={diskNumber}; workerProcess={workerId}; startedUtc={startedUtc:O}; elapsedMs={elapsed.ElapsedMilliseconds}.", ex);
+            throw;
         }
         finally
         {

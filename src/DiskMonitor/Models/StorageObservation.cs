@@ -24,10 +24,16 @@ internal enum AlertMode
 internal sealed class StorageObservation : EventArgs
 {
     public DateTimeOffset Timestamp { get; init; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset ReceivedUtc { get; init; } = DateTimeOffset.UtcNow;
     public string Source { get; init; } = string.Empty;
     public string Channel { get; init; } = string.Empty;
     public int? EventId { get; init; }
     public long? EventRecordId { get; init; }
+    public int? EventProcessId { get; init; }
+    public int? EventThreadId { get; init; }
+    public string? EventActivityId { get; init; }
+    public string RawEventXml { get; init; } = string.Empty;
+    public bool RawEventXmlTruncated { get; init; }
     public string RuleId { get; init; } = string.Empty;
     public ObservationCategory Category { get; init; }
     public ObservationSeverity Severity { get; init; }

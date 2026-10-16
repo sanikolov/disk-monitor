@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Xml.Linq;
 using DiskMonitor.Events;
 using DiskMonitor.Models;
 using Xunit;
@@ -70,7 +71,7 @@ public sealed class StorDiagEventTests
     }
 
     [Theory]
-    [InlineData(Provider, 506)]
+    [InlineData(Provider, 511)]
     [InlineData("Microsoft-Windows-Other", 507)]
     public void OtherEventIdsAndProvidersAreIgnored(string provider, int eventId)
     {
@@ -100,6 +101,117 @@ public sealed class StorDiagEventTests
         Assert.False(fromCurrentBoot.IsHistorical);
         Assert.True(beforeCutoff.IsHistorical);
     }
+
+    [Fact]
+    public void ActualNotReadyWarningRetainsQualifierStatusAndExecutionContext()
+    {
+        var document = XDocument.Parse(RealStorDiagXml(4, 6, "000000000000"));
+        var ns = document.Root!.Name.Namespace;
+        var data = document.Descendants(ns + "Data").ToDictionary(element => element.Attribute("Name")!.Value);
+        data["SrbStatus"].Value = "196";
+        data["SenseKey"].Value = "2";
+        data["DownLevelIrpStatus"].Value = "0xc0000185";
+        document.Root.Element(ns + "System")!.Add(
+            new XElement(ns + "Execution", new XAttribute("ProcessID", 5440), new XAttribute("ThreadID", 5336)),
+            new XElement(ns + "Correlation", new XAttribute("ActivityID", "{f89d410c-0847-4525-bc00-f88e9607d79b}")));
+        var xml = document.ToString();
+
+        var observation = ParseXml(507, xml);
+
+        Assert.NotNull(observation);
+        Assert.Equal(ObservationSeverity.Warning, observation.Severity);
+        Assert.Equal(AlertMode.Repeated, observation.AlertMode);
+        Assert.Contains("TEST UNIT READY", observation.Details, StringComparison.Ordinal);
+        Assert.Contains("NOT READY", observation.Details, StringComparison.Ordinal);
+        Assert.Contains("cause not reportable", observation.Details, StringComparison.Ordinal);
+        Assert.Contains("ASCQ=0x00", observation.Details, StringComparison.Ordinal);
+        Assert.Contains("AdditionalSenseCodeQualifier=0", observation.Details, StringComparison.Ordinal);
+        Assert.Contains("STATUS_IO_DEVICE_ERROR", observation.Details, StringComparison.Ordinal);
+        Assert.Contains("autosense valid=True; queue frozen=True", observation.Details, StringComparison.Ordinal);
+        Assert.Equal(5440, observation.EventProcessId);
+        Assert.Equal(5336, observation.EventThreadId);
+        Assert.Equal("{f89d410c-0847-4525-bc00-f88e9607d79b}", observation.EventActivityId);
+        Assert.Equal(xml, observation.RawEventXml);
+        Assert.False(observation.RawEventXmlTruncated);
+        Assert.DoesNotContain("unverified", observation.Details, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(500, "storage.read-failed")]
+    [InlineData(501, "storage.write-failed")]
+    [InlineData(502, "storage.read-failed")]
+    [InlineData(503, "storage.write-failed")]
+    [InlineData(505, "storage.read-failed")]
+    [InlineData(506, "storage.write-failed")]
+    public void RelatedDataFailuresRemainSeparateFromProbeWarnings(int eventId, string ruleId)
+    {
+        const string xml = """
+            <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+              <EventData>
+                <Data Name="DeviceNumber">6</Data>
+                <Data Name="SerialNumber">2009091700001639</Data>
+                <Data Name="IrpStatus">0xc00000a3</Data>
+                <Data Name="LBA">0x0</Data>
+                <Data Name="TransferByteCount">8192</Data>
+              </EventData>
+            </Event>
+            """;
+
+        var observation = ParseXml(eventId, xml);
+
+        Assert.NotNull(observation);
+        Assert.Equal(ruleId, observation.RuleId);
+        Assert.Equal(6, observation.DiskNumber);
+        Assert.Equal(DeviceSerial, observation.DeviceSerialNumber);
+        Assert.Equal(ObservationSeverity.Error, observation.Severity);
+        Assert.Equal(AlertMode.Immediate, observation.AlertMode);
+        Assert.Contains("STATUS_DEVICE_NOT_READY", observation.Details, StringComparison.Ordinal);
+        Assert.Contains("TransferByteCount=8192", observation.Details, StringComparison.Ordinal);
+        Assert.Contains("LBA=0x0", observation.Details, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(504, "storage.ioctl-failed")]
+    [InlineData(508, "storage.non-scsi-failed")]
+    [InlineData(509, "storage.pnp-failed")]
+    [InlineData(510, "storage.power-failed")]
+    [InlineData(523, "storage.capacity-failed")]
+    public void RelatedControlAndPowerFailuresAreRepeatedWarnings(int eventId, string ruleId)
+    {
+        var observation = ParseXml(eventId, RealStorDiagXml(4, 6, "000000000000"));
+
+        Assert.NotNull(observation);
+        Assert.Equal(ruleId, observation.RuleId);
+        Assert.Equal(ObservationSeverity.Warning, observation.Severity);
+        Assert.Equal(AlertMode.Repeated, observation.AlertMode);
+        Assert.Contains("DeviceGUID=", observation.Details, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MalformedXmlDoesNotPreventAlertNormalization()
+    {
+        var observation = ParseXml(507, "<Event>");
+
+        Assert.NotNull(observation);
+        Assert.Null(observation.EventProcessId);
+        Assert.Equal("<Event>", observation.RawEventXml);
+    }
+
+    [Fact]
+    public void OversizedDiagnosticXmlIsExplicitlyMarkedAsTruncated()
+    {
+        var xml = $"<Event><!--{new string('x', 70 * 1024)}--></Event>";
+
+        var observation = ParseXml(507, xml);
+
+        Assert.NotNull(observation);
+        Assert.True(observation.RawEventXmlTruncated);
+        Assert.Equal(64 * 1024, observation.RawEventXml.Length);
+    }
+
+    private static StorageObservation? ParseXml(int eventId, string xml) =>
+        EventObservationParser.ParseEvent(Provider, eventId, 2, 135400, DateTime.UtcNow,
+            "Storage command failed", xml, channel: Channel);
 
     private static StorageObservation? Parse507(
         long recordId,

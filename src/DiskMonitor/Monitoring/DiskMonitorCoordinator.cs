@@ -12,9 +12,10 @@ internal sealed class DiskMonitorCoordinator : IDisposable
     private readonly MonitorOptions _options;
     private readonly DateTimeOffset _startedUtc = DateTimeOffset.UtcNow;
     private readonly DateTimeOffset _bootTimeUtc;
-    private readonly HardwareProbeClient _pnpProbe = new();
-    private readonly HardwareProbeClient _inventoryProbe = new();
-    private readonly HardwareProbeClient _predictionProbe = new();
+    private readonly HardwareProbeClient _pnpProbe;
+    private readonly HardwareProbeClient _inventoryProbe;
+    private readonly HardwareProbeClient _predictionProbe;
+    private readonly StorageEventTelemetry _eventTelemetry;
     private readonly EventLogMonitor _eventLogMonitor;
     private readonly DeviceChangeMonitor _deviceChangeMonitor;
     private readonly IncidentEngine _incidentEngine;
@@ -54,6 +55,10 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         DateTimeOffset? bootTimeUtc = null)
     {
         _logger = logger;
+        _pnpProbe = new HardwareProbeClient(logger);
+        _inventoryProbe = new HardwareProbeClient(logger);
+        _predictionProbe = new HardwareProbeClient(logger);
+        _eventTelemetry = new StorageEventTelemetry(new MonitorLogger(AppPaths.StorageEventLogFile));
         _options = options;
         _bootTimeUtc = bootTimeUtc ?? SystemBootTime.GetUtc();
         _eventLogMonitor = new EventLogMonitor(logger, _bootTimeUtc);
@@ -106,6 +111,7 @@ internal sealed class DiskMonitorCoordinator : IDisposable
         }
 
         var log = _logger.GetHealth();
+        var storageEventLogError = _eventTelemetry.GetWriteError();
         return new MonitorStatusSnapshot
         {
             StartedUtc = _startedUtc,
@@ -122,7 +128,11 @@ internal sealed class DiskMonitorCoordinator : IDisposable
             EventChannelStartupGrace = TimeSpan.FromSeconds(30),
             LastDiagnosticWriteUtc = log.LastSuccessfulWriteUtc,
             MaximumDiagnosticLogAge = TimeSpan.FromMinutes(Math.Clamp(_options.MonitoringHeartbeatMinutes, 1, 60) + 1),
-            DiagnosticLogError = log.LastWriteError,
+            DiagnosticLogError = string.Join("; ", new[]
+            {
+                log.LastWriteError,
+                storageEventLogError is null ? null : $"{AppPaths.StorageEventLogFile}: {storageEventLogError}"
+            }.Where(error => !string.IsNullOrWhiteSpace(error))),
             DiagnosticLogPath = _logger.LogFile
         };
     }
@@ -239,11 +249,20 @@ internal sealed class DiskMonitorCoordinator : IDisposable
                 try
                 {
                     DeviceSnapshot? device;
+                    DateTimeOffset? inventorySampleUtc;
+                    string? inventoryIssue;
                     lock (_inventoryGate)
                     {
                         device = FindDeviceForObservationLocked(observation);
+                        inventorySampleUtc = device is not null &&
+                                             _lastKnownDevicesByNumber.TryGetValue(device.DiskNumber, out var lastKnown) &&
+                                             ReferenceEquals(device, lastKnown.Device)
+                            ? lastKnown.SeenAt
+                            : _lastRefreshSucceededAt;
+                        inventoryIssue = _inventoryIssue;
                     }
 
+                    _eventTelemetry.Record(observation, device, inventorySampleUtc, inventoryIssue);
                     _incidentEngine.Process(observation, device);
                 }
                 catch (Exception ex)

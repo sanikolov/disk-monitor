@@ -42,6 +42,8 @@ public sealed class EventLogQueryIntegrationTests
     [Theory]
     [InlineData("Microsoft-Windows-Ntfs/Operational", "Microsoft-Windows-Ntfs", 147)]
     [InlineData("Microsoft-Windows-Storage-ClassPnP/Operational", "Microsoft-Windows-StorDiag", 507)]
+    [InlineData("Microsoft-Windows-Storage-ClassPnP/Operational", "Microsoft-Windows-StorDiag", 500)]
+    [InlineData("Microsoft-Windows-Storage-ClassPnP/Operational", "Microsoft-Windows-StorDiag", 523)]
     public void ExistingCurrentBootDiskEventIsSelectedByWatcherQuery(string channel, string provider, int eventId)
     {
         if (!OperatingSystem.IsWindows())

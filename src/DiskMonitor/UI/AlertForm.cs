@@ -139,7 +139,7 @@ internal sealed class AlertForm : Form
         _risk.Text = $"{RiskAssessment.Label(risk)} — {RiskAssessment.Guidance(risk)}";
         _headline.Text = $"{incident.DeviceName}\r\n{incident.Category} - {incident.EvidenceCount} related observation(s)";
         var evidence = incident.Evidence.LastOrDefault();
-        _details.Text = $"Technical severity: {incident.Severity}\r\nFirst seen: {incident.FirstSeen.ToLocalTime():g}\r\nLast seen: {incident.LastSeen.ToLocalTime():g}\r\n\r\n{evidence?.Summary}\r\n{Trim(evidence?.Details ?? string.Empty, 900)}";
+        _details.Text = $"Technical severity: {incident.Severity}\r\nFirst seen: {incident.FirstSeen.ToLocalTime():g}\r\nLast seen: {incident.LastSeen.ToLocalTime():g}\r\n\r\n{evidence?.Summary}\r\n{evidence?.Details ?? string.Empty}";
     }
 
     protected override void OnActivated(EventArgs e)
@@ -260,6 +260,4 @@ internal sealed class AlertForm : Form
             UseShellExecute = true
         });
     }
-
-    private static string Trim(string value, int maximum) => value.Length <= maximum ? value : value[..maximum] + "…";
 }

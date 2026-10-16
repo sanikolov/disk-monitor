@@ -452,11 +452,7 @@ internal static class EventObservationParser
     private static readonly Regex DriveLetterRegex = new(@"(?<![A-Za-z])(?<drive>[A-Za-z]):", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex DeviceTokenRegex = new(@"(?<token>\\Device\\[^,\s)]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex RaidPortRegex = new(@"RaidPort(?<number>\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly string[] StorageCommandFields =
-    {
-        "DeviceNumber", "Vendor", "Model", "SerialNumber", "SrbStatus",
-        "ScsiStatus", "SenseKey", "AdditionalSenseCode", "CdbBytes", "NumberOfRetriesDone"
-    };
+    private const int MaximumDiagnosticXmlCharacters = 64 * 1024;
 
     public static StorageObservation? Parse(EventRecord record, DateTimeOffset bootTimeUtc)
     {
@@ -500,7 +496,8 @@ internal static class EventObservationParser
         var identityText = $"{payloadText}\n{details}";
         // ClassPnP reports a physical DeviceNumber but no volume. It must be correlated
         // with the inventory by serial as disk numbers can change after a restart.
-        var diskNumber = rule.Id == "storage.command-failed"
+        var isClassPnp = provider.Equals("Microsoft-Windows-StorDiag", StringComparison.OrdinalIgnoreCase);
+        var diskNumber = isClassPnp
             ? ParseClassPnpDeviceNumber(values)
             : ParseDiskNumber(values) ?? ParseDiskNumber(identityText);
         var deviceSerialNumber = values.TryGetValue("DeviceSerialNumber", out var ntfsSerial)
@@ -512,9 +509,10 @@ internal static class EventObservationParser
                           (rule.Category == ObservationCategory.Ntfs ? ParseDriveLetter(details) : null);
         var deviceToken = ParseDeviceToken(values, identityText);
         var raidPort = ParseRaidPort(identityText);
-        var observationDetails = rule.Id == "storage.command-failed"
-            ? AddStorageCommandFields(details, values)
+        var observationDetails = isClassPnp
+            ? StorageCommandDiagnostics.Describe(details, values)
             : details;
+        var context = ExtractExecutionContext(xml);
 
         return new StorageObservation
         {
@@ -523,6 +521,11 @@ internal static class EventObservationParser
             Channel = channel ?? string.Empty,
             EventId = id,
             EventRecordId = eventRecordId,
+            EventProcessId = context.ProcessId,
+            EventThreadId = context.ThreadId,
+            EventActivityId = context.ActivityId,
+            RawEventXml = xml.Length <= MaximumDiagnosticXmlCharacters ? xml : xml[..MaximumDiagnosticXmlCharacters],
+            RawEventXmlTruncated = xml.Length > MaximumDiagnosticXmlCharacters,
             RuleId = rule.Id,
             Category = rule.Category,
             Severity = rule.Severity,
@@ -591,11 +594,22 @@ internal static class EventObservationParser
             };
         }
 
-        if (provider == "microsoft-windows-stordiag" && id == 507)
+        if (provider == "microsoft-windows-stordiag")
         {
-            // A failed non-data SCSI command may be a rejected capability probe.
-            // Repetition warrants investigation without implying lost user data.
-            return new EventRule("storage.command-failed", ObservationCategory.Storage, ObservationSeverity.Warning, AlertMode.Repeated, "Windows reported a failed non-read/write storage command.");
+            // Keep actual read/write failures separate from rejected capability or
+            // readiness probes. The same burst often contains both kinds of evidence.
+            return id switch
+            {
+                500 or 502 or 505 => new EventRule("storage.read-failed", ObservationCategory.Storage, ObservationSeverity.Error, AlertMode.Immediate, "Windows reported a failed storage read request."),
+                501 or 503 or 506 => new EventRule("storage.write-failed", ObservationCategory.Storage, ObservationSeverity.Error, AlertMode.Immediate, "Windows reported a failed storage write request."),
+                504 => new EventRule("storage.ioctl-failed", ObservationCategory.Storage, ObservationSeverity.Warning, AlertMode.Repeated, "Windows reported a failed storage control request."),
+                507 => new EventRule("storage.command-failed", ObservationCategory.Storage, ObservationSeverity.Warning, AlertMode.Repeated, "Windows reported a failed non-read/write storage command."),
+                508 => new EventRule("storage.non-scsi-failed", ObservationCategory.Storage, ObservationSeverity.Warning, AlertMode.Repeated, "Windows reported a failed non-SCSI storage request."),
+                509 => new EventRule("storage.pnp-failed", ObservationCategory.Storage, ObservationSeverity.Warning, AlertMode.Repeated, "Windows reported a failed storage Plug and Play request."),
+                510 => new EventRule("storage.power-failed", ObservationCategory.Storage, ObservationSeverity.Warning, AlertMode.Repeated, "Windows reported a failed storage power request."),
+                523 => new EventRule("storage.capacity-failed", ObservationCategory.Storage, ObservationSeverity.Warning, AlertMode.Repeated, "Windows could not read the storage device capacity."),
+                _ => null
+            };
         }
 
         if (provider.Contains("kernel-pnp", StringComparison.Ordinal))
@@ -795,14 +809,22 @@ internal static class EventObservationParser
             ? number
             : null;
 
-    private static string AddStorageCommandFields(string description, Dictionary<string, string> values)
+    private static (int? ProcessId, int? ThreadId, string? ActivityId) ExtractExecutionContext(string xml)
     {
-        // StorDiag 507's formatted message omits the fields needed to distinguish
-        // a rejected capability probe from retries or failed user-data writes.
-        var fields = StorageCommandFields
-            .Where(values.ContainsKey)
-            .Select(name => $"{name}={values[name].Trim()}");
-        return $"{description} {string.Join("; ", fields)}".Trim();
+        try
+        {
+            var ns = XNamespace.Get("http://schemas.microsoft.com/win/2004/08/events/event");
+            var system = XDocument.Parse(xml).Root?.Element(ns + "System");
+            var execution = system?.Element(ns + "Execution");
+            return (
+                int.TryParse(execution?.Attribute("ProcessID")?.Value, out var processId) ? processId : null,
+                int.TryParse(execution?.Attribute("ThreadID")?.Value, out var threadId) ? threadId : null,
+                system?.Element(ns + "Correlation")?.Attribute("ActivityID")?.Value);
+        }
+        catch (System.Xml.XmlException)
+        {
+            return (null, null, null);
+        }
     }
 
     private static int? ParseDiskNumber(string text)

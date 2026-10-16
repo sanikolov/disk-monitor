@@ -1,4 +1,5 @@
 using System.Management;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using DiskMonitor.Infrastructure;
 using DiskMonitor.Models;
@@ -19,12 +20,19 @@ internal sealed class StorageInventory
 
     public StorageInventorySnapshot Read()
     {
+        _logger.Info($"Inventory query started: process={Environment.ProcessId}; class=Win32_LogicalDiskToPartition.");
         var driveLetters = ReadDriveLetters();
+        _logger.Info($"Inventory query finished: process={Environment.ProcessId}; class=Win32_LogicalDiskToPartition; associations={driveLetters.Count}.");
+        _logger.Info($"Inventory query started: process={Environment.ProcessId}; class=Win32_DiskDrive.");
         var legacyDevices = TryReadWin32Disks(driveLetters, out var legacyReadSucceeded);
+        _logger.Info($"Inventory query finished: process={Environment.ProcessId}; class=Win32_DiskDrive; succeeded={legacyReadSucceeded}; devices={legacyDevices.Count}.");
+        _logger.Info($"Legacy inventory device snapshots: {JsonSerializer.Serialize(legacyDevices)}");
 
         try
         {
+            _logger.Info($"Inventory query started: process={Environment.ProcessId}; class=MSFT_Disk.");
             var devices = ReadMsftDisks(driveLetters);
+            _logger.Info($"Inventory query finished: process={Environment.ProcessId}; class=MSFT_Disk; devices={devices.Count}.");
             if (devices.Count > 0)
             {
                 MergeTransportMetadata(devices, legacyDevices);

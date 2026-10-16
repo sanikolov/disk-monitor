@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using DiskMonitor.Infrastructure;
 using DiskMonitor.Models;
 using DiskMonitor.Storage;
 using Xunit;
@@ -34,7 +35,8 @@ public sealed class HardwareProbeClientTests
             File.WriteAllText(fastScript,
                 "[Console]::Out.WriteLine('{\"DiskNumber\":42,\"Supported\":false,\"PredictsFailure\":false,\"ErrorCode\":2}')");
             var useSlowScript = true;
-            using var client = new HardwareProbeClient((_, _) => PowerShellScript(useSlowScript ? slowScript : fastScript));
+            var logPath = Path.Combine(directory, "probes.log");
+            using var client = new HardwareProbeClient((_, _) => PowerShellScript(useSlowScript ? slowScript : fastScript), new MonitorLogger(logPath));
 
             await Assert.ThrowsAsync<TimeoutException>(() =>
                 client.RunPredictionAsync(42, TimeSpan.FromMilliseconds(500), CancellationToken.None));
@@ -43,6 +45,12 @@ public sealed class HardwareProbeClientTests
             var recovered = await client.RunPredictionAsync(42, TimeSpan.FromSeconds(10), CancellationToken.None);
             Assert.Equal(42, recovered.DiskNumber);
             Assert.Equal(2, recovered.ErrorCode);
+            var log = File.ReadAllText(logPath);
+            Assert.Contains("Hardware probe started: command=--probe-predict; disk=42", log, StringComparison.Ordinal);
+            Assert.Contains("workerProcess=", log, StringComparison.Ordinal);
+            Assert.Contains("elapsedMs=", log, StringComparison.Ordinal);
+            Assert.Contains("termination=confirmed", log, StringComparison.Ordinal);
+            Assert.Contains("exitCode=0", log, StringComparison.Ordinal);
         }
         finally
         {
